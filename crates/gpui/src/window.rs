@@ -2989,7 +2989,11 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
+        let deferred_hitboxes_start = self.next_frame.hitboxes.len();
         self.prepaint_deferred_draws(cx);
+        // Deferred content that can be clicked (menus, popovers) registers
+        // hitboxes; deferred decoration painted only for z-order does not.
+        let deferred_takes_input = self.next_frame.hitboxes.len() > deferred_hitboxes_start;
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
@@ -3024,10 +3028,11 @@ impl Window {
         self.paint_inspector(inspector_element, cx);
 
         // Root paint is beneath native surfaces; deferred menus, prompts and
-        // tooltips use the transparent plane. Passive tooltips must not take
-        // input away from a webview merely because they have visible pixels.
+        // tooltips use the transparent plane. Passive content must not take
+        // input away from a webview merely because it has visible pixels:
+        // tooltips never do, and deferred content only when it is clickable.
         self.next_frame.overlay_scene_start = self.next_frame.scene.len();
-        self.next_frame.overlay_capture_input = !self.next_frame.deferred_draws.is_empty()
+        self.next_frame.overlay_capture_input = deferred_takes_input
             || prompt_element.is_some()
             || active_drag_element.is_some();
         self.paint_deferred_draws(cx);
