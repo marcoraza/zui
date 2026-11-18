@@ -916,7 +916,8 @@ pub enum PresentMotion {
     /// `path(phase).scale` around its own center, where `phase` is where the
     /// wall clock is inside `period` (`0..1`). Offsets are fractions of the
     /// sprite's painted size, so one path serves every size. Every travel with
-    /// the same period moves in sync.
+    /// the same period moves in sync. `path(phase).opacity` scales the
+    /// sprite's painted alpha, so it can fade while it moves.
     Travel {
         /// Duration of one full trip along `path`.
         period: Duration,
@@ -934,6 +935,19 @@ pub struct TravelPose {
     pub offset: Point<f32>,
     /// Uniform scale around the sprite's center; `1.0` keeps its size.
     pub scale: f32,
+    /// Factor on the alpha the sprite was painted with, in `0..1`; `1.0`
+    /// keeps its color. Lets one sprite fade while it moves, so a loader cell
+    /// that breathes in size and light needs one sprite, not a re-render.
+    pub opacity: f32,
+}
+
+impl TravelPose {
+    /// Where the sprite was painted, at its own size and color.
+    pub const REST: Self = Self {
+        offset: Point { x: 0., y: 0. },
+        scale: 1.,
+        opacity: 1.,
+    };
 }
 
 /// The curve of a [`PresentMotion::Travel`]: the sprite's pose at `phase`,
@@ -1119,7 +1133,18 @@ impl SpriteAnimation {
     /// The sprite's color at `since_epoch`.
     pub(crate) fn color_at(&self, since_epoch: Duration) -> Hsla {
         match self.animation.motion {
-            PresentMotion::Spin { .. } | PresentMotion::Travel { .. } => self.color,
+            PresentMotion::Spin { .. } => self.color,
+            PresentMotion::Travel { period, path } => {
+                let Some(phase) = wall_clock_phase(since_epoch, period) else {
+                    return self.color;
+                };
+                let opacity = path(phase).opacity;
+                if opacity.is_finite() {
+                    self.color.opacity(opacity.clamp(0., 1.))
+                } else {
+                    self.color
+                }
+            }
             PresentMotion::Pulse { period } => {
                 let Some(phase) = wall_clock_phase(since_epoch, period) else {
                     return self.color;
@@ -1536,6 +1561,7 @@ mod tests {
             TravelPose {
                 offset: point(phase, -phase),
                 scale: 1. + phase,
+                opacity: 1. - phase,
             }
         }
         let travel = SpriteAnimation {
@@ -1561,9 +1587,15 @@ mod tests {
                 .scale(size(1., 1.))
                 .translate(point(ScaledPixels(-10.), ScaledPixels(-5.)))
         );
-        // A travel never touches the color.
+        // Half way the sprite is at half its painted alpha; at the start it
+        // keeps its own color.
+        assert!(
+            (travel.color_at(Duration::from_millis(1_700_000_000_500)).a - travel.color.a * 0.5)
+                .abs()
+                < 1e-6
+        );
         assert_eq!(
-            travel.color_at(Duration::from_millis(1_700_000_000_500)),
+            travel.color_at(Duration::from_millis(1_700_000_000_000)),
             travel.color
         );
     }
