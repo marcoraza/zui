@@ -1,9 +1,9 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PresentAnimation, SharedString,
+    Size, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window,
+    WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -394,6 +394,7 @@ pub struct StyledText {
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     layout: TextLayout,
+    animation: Option<PresentAnimation>,
 }
 
 impl StyledText {
@@ -405,7 +406,29 @@ impl StyledText {
             delayed_highlights: None,
             delayed_font_family_overrides: None,
             layout: TextLayout::default(),
+            animation: None,
         }
+    }
+
+    /// Sweep a highlight across the text, resolved when the window presents
+    /// a frame: build `animation` with [`PresentAnimation::sweep`]. The text
+    /// is painted in its own colors and each glyph is then recolored toward
+    /// the sweep's color without re-rendering, laying out or repainting any
+    /// view, so it keeps going when the containing view is cached. A glyph's
+    /// `x` is the center of its advance divided by the width of its line;
+    /// a line that wraps counts as one line (the sweep runs through the rows
+    /// in reading order) and each hard line (`\n`) sweeps on its own. Emoji
+    /// are not animated. With [`App::reduce_motion`] set the text is painted
+    /// still in its own colors.
+    pub fn sweep(self, animation: PresentAnimation) -> Self {
+        self.with_present_animation(animation)
+    }
+
+    /// Attach a [`PresentAnimation`] resolved at presentation time to every
+    /// glyph of the text. See [`Self::sweep`].
+    pub fn with_present_animation(mut self, animation: PresentAnimation) -> Self {
+        self.animation = Some(animation);
+        self
     }
 
     /// Get the layout for this element. This can be used to map indices to pixels and vice versa.
@@ -597,7 +620,8 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.layout.paint(&self.text, window, cx)
+        self.layout
+            .paint_animated(&self.text, self.animation, window, cx)
     }
 }
 
@@ -790,6 +814,16 @@ impl TextLayout {
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
+        self.paint_animated(text, None, window, cx)
+    }
+
+    fn paint_animated(
+        &self,
+        text: &str,
+        animation: Option<PresentAnimation>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -813,11 +847,12 @@ impl TextLayout {
                 cx,
             )
             .log_err();
-            line.paint(
+            line.paint_animated(
                 line_origin,
                 line_height,
                 text_style.text_align,
                 Some(bounds),
+                animation,
                 window,
                 cx,
             )

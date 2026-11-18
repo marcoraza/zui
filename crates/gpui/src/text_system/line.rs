@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
-    WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, PresentAnimation,
+    RenderGlyphParams, Result, ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign,
+    UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -97,6 +97,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            None,
             window,
             cx,
         )?;
@@ -293,11 +294,46 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            None,
             window,
             cx,
         )?;
 
         Ok(())
+    }
+
+    /// Like [`Self::paint`], with a [`PresentAnimation`] applied to every
+    /// non-emoji glyph at presentation time. Each glyph's position along the
+    /// text is the center of its advance in the unwrapped line divided by the
+    /// unwrapped line's width, so a [`crate::PresentMotion::Sweep`] runs in
+    /// reading order through the wrapped rows, as if they were one line.
+    pub(crate) fn paint_animated(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        animation: Option<PresentAnimation>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        let align_width = match bounds {
+            Some(bounds) => Some(bounds.size.width),
+            None => self.layout.wrap_width,
+        };
+
+        paint_line(
+            origin,
+            &self.layout.unwrapped_layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &self.wrap_boundaries,
+            animation,
+            window,
+            cx,
+        )
     }
 
     /// Paint the background of line of text to the window.
@@ -339,6 +375,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    animation: Option<PresentAnimation>,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -531,6 +568,17 @@ fn paint_line(
                             glyph.id,
                             layout.font_size,
                         )?;
+                    } else if animation.is_some() {
+                        window.paint_animated_glyph(
+                            glyph_origin + baseline_offset + vertical_offset,
+                            run.font_id,
+                            glyph.id,
+                            layout.font_size,
+                            color,
+                            animation,
+                            glyph_position_along_line(layout, run_ix, glyph_ix),
+                            cx,
+                        )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
@@ -575,6 +623,26 @@ fn paint_line(
 
         Ok(())
     })
+}
+
+/// Where the center of a glyph's advance sits along the unwrapped line, in
+/// `0..1`. The advance runs to the next glyph's position, or to the end of
+/// the line for the last glyph.
+fn glyph_position_along_line(layout: &LineLayout, run_ix: usize, glyph_ix: usize) -> f32 {
+    let width = layout.width.0;
+    if width <= 0. {
+        return 0.5;
+    }
+    let start = layout.runs[run_ix].glyphs[glyph_ix].position.x.0;
+    let end = layout.runs[run_ix].glyphs[glyph_ix + 1..]
+        .first()
+        .or_else(|| {
+            layout.runs[run_ix + 1..]
+                .iter()
+                .find_map(|run| run.glyphs.first())
+        })
+        .map_or(width, |next| next.position.x.0);
+    ((start + end) / 2. / width).clamp(0., 1.)
 }
 
 fn paint_line_background(

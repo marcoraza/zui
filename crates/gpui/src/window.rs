@@ -10,15 +10,15 @@ use crate::{
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    PresentAnimation, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    SpriteAnimation, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, profiler, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1097,6 +1097,9 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// When the last frame carrying presentation-time animations (see
+    /// [`PresentAnimation`]) was presented; paces those animations.
+    last_animation_present: Option<Instant>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1548,7 +1551,7 @@ impl Window {
                 {
                     None
                 } else if !active.get() {
-                    Some(Duration::from_micros(33333))
+                    Some(INACTIVE_FRAME_INTERVAL)
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
                 } else {
@@ -1588,7 +1591,10 @@ impl Window {
                 // to prevent display underclocking during active input.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate())
+                    || handle
+                        .update(&mut cx, |_, window, _| window.present_animation_due(now))
+                        .unwrap_or(false);
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -1619,6 +1625,7 @@ impl Window {
                             && window.next_frame_callbacks.borrow().is_empty()
                             && !(window.active.get()
                                 && window.input_rate_tracker.borrow().is_high_rate())
+                            && !window.rendered_frame.scene.has_present_animations()
                         {
                             window.platform_window.pause_frame_requests();
                         }
@@ -1817,6 +1824,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            last_animation_present: None,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -2918,6 +2926,15 @@ impl Window {
         for callback in &self.rendered_frame.presentation_callbacks {
             callback();
         }
+        if self.rendered_frame.scene.has_present_animations() {
+            let since_epoch = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .unwrap_or_default();
+            self.rendered_frame
+                .scene
+                .resolve_present_animations(since_epoch);
+            self.last_animation_present = Some(Instant::now());
+        }
         self.platform_window.draw_layered(
             &self.rendered_frame.scene,
             self.rendered_frame.overlay_scene_start,
@@ -2927,6 +2944,19 @@ impl Window {
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Whether the rendered scene has a presentation-time animation whose
+    /// next frame is due at `now`. Inactive windows are capped at ~30 fps,
+    /// like every other frame they present.
+    fn present_animation_due(&self, now: Instant) -> bool {
+        let Some(mut interval) = self.rendered_frame.scene.present_animation_interval() else {
+            return false;
+        };
+        if !self.active.get() {
+            interval = interval.max(INACTIVE_FRAME_INTERVAL);
+        }
+        animation_frame_due(self.last_animation_present, now, interval)
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
@@ -4298,6 +4328,49 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
+        self.insert_glyph(origin, font_id, glyph_id, font_size, color, None, 0.)
+    }
+
+    /// Like [`Self::paint_glyph`], with an optional [`PresentAnimation`] that
+    /// the window resolves each time it presents a frame, without
+    /// re-rendering or repainting any view. `position` is where the glyph's
+    /// center sits along its text, in `0..1`; [`crate::PresentMotion::Sweep`] reads
+    /// it. Works for both subpixel and grayscale glyphs; the glyph is
+    /// rasterized for `color` (its dilation, on platforms that pick one by
+    /// color, follows the painted color, not the animated one). With
+    /// [`App::reduce_motion`] set, or a static animation, the glyph is painted
+    /// still in `color`.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_animated_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        animation: Option<PresentAnimation>,
+        position: f32,
+        cx: &App,
+    ) -> Result<()> {
+        let animation = animation.filter(|animation| !animation.is_static() && !cx.reduce_motion());
+        self.insert_glyph(
+            origin, font_id, glyph_id, font_size, color, animation, position,
+        )
+    }
+
+    /// Shared by [`Self::paint_glyph`] and [`Self::paint_animated_glyph`];
+    /// `animation`, if any, is live.
+    fn insert_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        animation: Option<PresentAnimation>,
+        position: f32,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity_for_bounds(&Bounds {
@@ -4345,27 +4418,54 @@ impl Window {
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.snapped_content_mask();
+            let color = color.opacity(element_opacity);
+            let animation = animation.map(|animation| SpriteAnimation {
+                animation: animation.with_opacity(element_opacity),
+                base: TransformationMatrix::unit(),
+                pivot: bounds.center(),
+                color,
+                position: if position.is_nan() {
+                    0.
+                } else {
+                    position.clamp(0., 1.)
+                },
+                extent: bounds.size,
+            });
 
             if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
+                let sprite = SubpixelSprite {
                     order: 0,
                     pad: 0,
                     bounds,
                     content_mask,
-                    color: color.opacity(element_opacity),
+                    color,
                     tile,
                     transformation: TransformationMatrix::unit(),
-                });
+                };
+                match animation {
+                    Some(animation) => self
+                        .next_frame
+                        .scene
+                        .insert_animated_subpixel_sprite(sprite, animation),
+                    None => self.next_frame.scene.insert_primitive(sprite),
+                }
             } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
+                let sprite = MonochromeSprite {
                     order: 0,
                     pad: 0,
                     bounds,
                     content_mask,
-                    color: color.opacity(element_opacity),
+                    color,
                     tile,
                     transformation: TransformationMatrix::unit(),
-                });
+                };
+                match animation {
+                    Some(animation) => self
+                        .next_frame
+                        .scene
+                        .insert_animated_monochrome_sprite(sprite, animation),
+                    None => self.next_frame.scene.insert_primitive(sprite),
+                }
             }
         }
         Ok(())
@@ -4461,8 +4561,30 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         path: SharedString,
+        data: Option<&[u8]>,
+        transformation: TransformationMatrix,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
+        self.paint_animated_svg(bounds, path, data, transformation, None, color, cx)
+    }
+
+    /// Like [`Self::paint_svg`], with an optional [`PresentAnimation`] that
+    /// the window resolves each time it presents a frame, around the center
+    /// of `bounds`. The animation moves the sprite without re-rendering or
+    /// repainting any view, and keeps the window presenting (at the
+    /// animation's frame interval) for as long as the sprite is in the
+    /// rendered scene. With [`App::reduce_motion`] set the sprite is painted
+    /// still and nothing keeps presenting.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_animated_svg(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
         mut data: Option<&[u8]>,
         transformation: TransformationMatrix,
+        animation: Option<PresentAnimation>,
         color: Hsla,
         cx: &App,
     ) -> Result<()> {
@@ -4506,7 +4628,7 @@ impl Window {
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
             .map_size(|size| size.ceil());
 
-        self.next_frame.scene.insert_primitive(MonochromeSprite {
+        let sprite = MonochromeSprite {
             order: 0,
             pad: 0,
             bounds: final_bounds,
@@ -4514,7 +4636,21 @@ impl Window {
             color: color.opacity(element_opacity),
             tile,
             transformation,
-        });
+        };
+        match animation.filter(|animation| !animation.is_static() && !cx.reduce_motion()) {
+            Some(animation) => self.next_frame.scene.insert_animated_monochrome_sprite(
+                sprite,
+                SpriteAnimation {
+                    animation: animation.with_opacity(element_opacity),
+                    base: transformation,
+                    pivot: bounds.center(),
+                    color: sprite.color,
+                    position: 0.5,
+                    extent: bounds.size,
+                },
+            ),
+            None => self.next_frame.scene.insert_primitive(sprite),
+        }
 
         Ok(())
     }
@@ -6820,6 +6956,21 @@ pub fn quad(
     }
 }
 
+/// Frame interval cap for windows that are not focused (~30 fps).
+const INACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(33333);
+
+/// Whether a presentation-time animation last presented at `last` needs a
+/// new frame at `now`. Display ticks jitter by a millisecond or two, so a
+/// tick that lands slightly early still counts; without that slack a 30 fps
+/// animation on a 60 Hz display would drop to 20 fps.
+fn animation_frame_due(last: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    let slack = (interval / 4).min(Duration::from_millis(4));
+    now.saturating_duration_since(last) >= interval.saturating_sub(slack)
+}
+
 /// Creates a filled quad with the given bounds and background color.
 pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>) -> PaintQuad {
     PaintQuad {
@@ -7039,6 +7190,575 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    struct SpinnerAssets;
+
+    impl crate::AssetSource for SpinnerAssets {
+        fn load(&self, _: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+            Ok(Some(std::borrow::Cow::Borrowed(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="0" y="0" width="16" height="4" fill="black"/></svg>"#,
+            )))
+        }
+
+        fn list(&self, _: &str) -> anyhow::Result<Vec<crate::SharedString>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Renders an arc that spins at presentation time, counting renders
+    /// and presented frames.
+    struct Spinner {
+        spinning: bool,
+        frame_interval: std::time::Duration,
+        renders: Rc<Cell<u32>>,
+        presents: Rc<Cell<u32>>,
+    }
+
+    impl Render for Spinner {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let presents = self.presents.clone();
+            let arc = crate::svg()
+                .path("spinner.svg")
+                .size(px(16.))
+                .text_color(crate::black());
+            let arc = if self.spinning {
+                arc.spin(std::time::Duration::from_millis(900), self.frame_interval)
+            } else {
+                arc
+            };
+            div().size_full().child(arc).child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        window.on_present(move || presents.set(presents.get() + 1));
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    struct SpinnerHarness {
+        cx: TestAppContext,
+        handle: crate::WindowHandle<Spinner>,
+        platform: crate::TestWindow,
+        renders: Rc<Cell<u32>>,
+        presents: Rc<Cell<u32>>,
+    }
+
+    impl SpinnerHarness {
+        fn new(frame_interval: std::time::Duration, reduce_motion: bool) -> Self {
+            let mut cx = TestAppContext::single();
+            cx.update(|cx| {
+                cx.svg_renderer = crate::SvgRenderer::new(std::sync::Arc::new(SpinnerAssets));
+                cx.set_reduce_motion(reduce_motion);
+            });
+            let renders = Rc::new(Cell::new(0));
+            let presents = Rc::new(Cell::new(0));
+            let handle = cx.add_window({
+                let renders = renders.clone();
+                let presents = presents.clone();
+                move |_, _| Spinner {
+                    spinning: true,
+                    frame_interval,
+                    renders,
+                    presents,
+                }
+            });
+            let platform = cx
+                .update_window(handle.into(), |_, window, _| {
+                    window.active.set(true);
+                    window.platform_window.as_test().unwrap().clone()
+                })
+                .unwrap();
+            Self {
+                cx,
+                handle,
+                platform,
+                renders,
+                presents,
+            }
+        }
+
+        fn read_window<R>(&mut self, f: impl FnOnce(&Window) -> R) -> R {
+            self.cx
+                .update_window(self.handle.into(), |_, window, _| f(window))
+                .unwrap()
+        }
+
+        fn is_clean(&mut self) -> bool {
+            self.read_window(|window| {
+                window.dirty_views.is_empty() && !window.invalidator.is_dirty()
+            })
+        }
+
+        fn has_spin(&mut self) -> bool {
+            self.read_window(|window| window.rendered_frame.scene.has_present_animations())
+        }
+    }
+
+    #[test]
+    fn spinning_svg_presents_without_rendering() {
+        let mut h = SpinnerHarness::new(std::time::Duration::ZERO, false);
+        assert!(h.platform.simulate_display_tick(), "first frame draws");
+        assert_eq!(h.renders.get(), 1);
+        assert_eq!(h.presents.get(), 1);
+        assert!(h.has_spin());
+        let animated_sprites = h.read_window(|window| {
+            window
+                .rendered_frame
+                .scene
+                .monochrome_sprites
+                .iter()
+                .filter(|sprite| sprite.pad != 0)
+                .count()
+        });
+        assert_eq!(animated_sprites, 1, "the svg is the only animated sprite");
+
+        for tick in 2..=6 {
+            assert!(
+                h.platform.simulate_display_tick(),
+                "a live spin must keep frames coming (tick {tick})"
+            );
+            assert_eq!(h.presents.get(), tick, "every due tick presents");
+            assert_eq!(h.renders.get(), 1, "presenting a spin must not render");
+            assert!(h.is_clean(), "presenting a spin must not dirty any view");
+        }
+    }
+
+    /// Renders one svg that travels along a path holding it at half its
+    /// painted alpha, counting renders.
+    struct Fader {
+        renders: Rc<Cell<u32>>,
+    }
+
+    fn half_faded(_: f32) -> crate::TravelPose {
+        crate::TravelPose {
+            opacity: 0.5,
+            ..crate::TravelPose::REST
+        }
+    }
+
+    impl Render for Fader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().child(
+                crate::svg()
+                    .path("fader.svg")
+                    .size(px(16.))
+                    .text_color(crate::black())
+                    .travel(
+                        std::time::Duration::from_millis(900),
+                        half_faded,
+                        std::time::Duration::ZERO,
+                    ),
+            )
+        }
+    }
+
+    #[test]
+    fn fading_travel_presents_without_rendering() {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| {
+            cx.svg_renderer = crate::SvgRenderer::new(std::sync::Arc::new(SpinnerAssets));
+        });
+        let renders = Rc::new(Cell::new(0));
+        let handle = cx.add_window({
+            let renders = renders.clone();
+            move |_, _| Fader { renders }
+        });
+        let platform = cx
+            .update_window(handle.into(), |_, window, _| {
+                window.active.set(true);
+                window.platform_window.as_test().unwrap().clone()
+            })
+            .unwrap();
+        let sprite_alpha = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, _| {
+                let sprites: Vec<_> = window
+                    .rendered_frame
+                    .scene
+                    .monochrome_sprites
+                    .iter()
+                    .filter(|sprite| sprite.pad != 0)
+                    .map(|sprite| sprite.color.a)
+                    .collect();
+                (sprites.len(), sprites.first().copied())
+            })
+            .unwrap()
+        };
+        assert!(platform.simulate_display_tick(), "first frame draws");
+        for _ in 0..3 {
+            assert!(
+                platform.simulate_display_tick(),
+                "a live travel must keep frames coming"
+            );
+            let (count, alpha) = sprite_alpha(&mut cx);
+            assert_eq!(count, 1, "the svg is the only animated sprite");
+            let alpha = alpha.unwrap();
+            assert!(
+                (alpha - 0.5).abs() < 1e-6,
+                "the path's opacity scales the painted alpha, got {alpha}"
+            );
+        }
+        assert_eq!(renders.get(), 1, "fading at present time must not render");
+    }
+
+    #[test]
+    fn spin_presents_no_faster_than_its_frame_interval() {
+        let mut h = SpinnerHarness::new(std::time::Duration::from_secs(3600), false);
+        assert!(h.platform.simulate_display_tick());
+        assert_eq!(h.presents.get(), 1);
+        for _ in 0..3 {
+            assert!(
+                h.platform.simulate_display_tick(),
+                "waiting for the next spin frame must not pause frame requests"
+            );
+        }
+        assert_eq!(h.presents.get(), 1, "no frame is due within the interval");
+        assert_eq!(h.renders.get(), 1);
+    }
+
+    #[test]
+    fn window_parks_once_the_spin_is_gone() {
+        let mut h = SpinnerHarness::new(std::time::Duration::ZERO, false);
+        assert!(h.platform.simulate_display_tick());
+        assert!(h.platform.simulate_display_tick());
+        assert!(h.has_spin());
+
+        h.handle
+            .update(&mut h.cx, |spinner, _, cx| {
+                spinner.spinning = false;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(
+            h.platform.simulate_display_tick(),
+            "redraw without the spin"
+        );
+        assert_eq!(h.renders.get(), 2);
+        assert!(!h.has_spin());
+        assert!(
+            !h.platform.simulate_display_tick(),
+            "with no spin left the window must park"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_paints_the_spinner_still() {
+        let mut h = SpinnerHarness::new(std::time::Duration::ZERO, true);
+        assert!(h.platform.simulate_display_tick());
+        assert_eq!(h.renders.get(), 1);
+        let sprites = h.read_window(|window| window.rendered_frame.scene.monochrome_sprites.len());
+        assert_eq!(sprites, 1, "the spinner is still painted");
+        assert!(!h.has_spin());
+        assert!(
+            !h.platform.simulate_display_tick(),
+            "reduced motion must not keep the window presenting"
+        );
+    }
+
+    /// Holds the spinner as a cached child view and re-renders on its own.
+    struct SpinnerHost {
+        spinner: crate::Entity<Spinner>,
+        renders: Rc<Cell<u32>>,
+    }
+
+    impl Render for SpinnerHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().child(
+                self.spinner
+                    .clone()
+                    .cached(crate::StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    #[test]
+    fn cached_spinner_keeps_spinning_when_its_parent_rerenders() {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| {
+            cx.svg_renderer = crate::SvgRenderer::new(std::sync::Arc::new(SpinnerAssets));
+        });
+        let spinner_renders = Rc::new(Cell::new(0));
+        let presents = Rc::new(Cell::new(0));
+        let host_renders = Rc::new(Cell::new(0));
+        let handle = cx.add_window({
+            let spinner_renders = spinner_renders.clone();
+            let presents = presents.clone();
+            let host_renders = host_renders.clone();
+            move |_, cx| SpinnerHost {
+                spinner: cx.new(|_| Spinner {
+                    spinning: true,
+                    frame_interval: std::time::Duration::ZERO,
+                    renders: spinner_renders,
+                    presents,
+                }),
+                renders: host_renders,
+            }
+        });
+        let platform = cx
+            .update_window(handle.into(), |_, window, _| {
+                window.active.set(true);
+                window.platform_window.as_test().unwrap().clone()
+            })
+            .unwrap();
+        assert!(platform.simulate_display_tick());
+        assert_eq!((host_renders.get(), spinner_renders.get()), (1, 1));
+
+        handle.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        assert!(platform.simulate_display_tick());
+        assert_eq!(host_renders.get(), 2, "the parent re-rendered");
+        assert_eq!(
+            spinner_renders.get(),
+            1,
+            "the spinner was replayed from cache"
+        );
+        let has_spin = cx
+            .update_window(handle.into(), |_, window, _| {
+                window.rendered_frame.scene.has_present_animations()
+            })
+            .unwrap();
+        assert!(has_spin, "the replayed sprite must keep its spin");
+
+        let presents_before = presents.get();
+        assert!(
+            platform.simulate_display_tick(),
+            "and keep the window presenting"
+        );
+        assert_eq!(presents.get(), presents_before + 1);
+        assert_eq!(spinner_renders.get(), 1);
+    }
+
+    /// The no-op text system, with glyphs that rasterize to 8x8 tiles so
+    /// text actually reaches the scene as sprites.
+    struct VisibleGlyphs(crate::NoopTextSystem);
+
+    impl crate::PlatformTextSystem for VisibleGlyphs {
+        fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> anyhow::Result<()> {
+            self.0.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            self.0.all_font_names()
+        }
+        fn font_id(&self, descriptor: &crate::Font) -> anyhow::Result<crate::FontId> {
+            self.0.font_id(descriptor)
+        }
+        fn font_metrics(&self, font_id: crate::FontId) -> crate::FontMetrics {
+            self.0.font_metrics(font_id)
+        }
+        fn typographic_bounds(
+            &self,
+            font_id: crate::FontId,
+            glyph_id: crate::GlyphId,
+        ) -> anyhow::Result<Bounds<f32>> {
+            self.0.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(
+            &self,
+            font_id: crate::FontId,
+            glyph_id: crate::GlyphId,
+        ) -> anyhow::Result<crate::Size<f32>> {
+            self.0.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: crate::FontId, ch: char) -> Option<crate::GlyphId> {
+            self.0.glyph_for_char(font_id, ch)
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: crate::FontId,
+            font_size: Pixels,
+        ) -> crate::TextRenderingMode {
+            self.0.recommended_rendering_mode(font_id, font_size)
+        }
+        fn glyph_raster_bounds(
+            &self,
+            _: &crate::RenderGlyphParams,
+        ) -> anyhow::Result<Bounds<crate::DevicePixels>> {
+            Ok(Bounds {
+                origin: crate::point(crate::DevicePixels(0), crate::DevicePixels(-8)),
+                size: size(crate::DevicePixels(8), crate::DevicePixels(8)),
+            })
+        }
+        fn rasterize_glyph(
+            &self,
+            _: &crate::RenderGlyphParams,
+            raster_bounds: Bounds<crate::DevicePixels>,
+        ) -> anyhow::Result<(crate::Size<crate::DevicePixels>, Vec<u8>)> {
+            Ok((raster_bounds.size, vec![255; 64]))
+        }
+        fn layout_line(
+            &self,
+            text: &str,
+            font_size: Pixels,
+            runs: &[crate::FontRun],
+        ) -> crate::LineLayout {
+            self.0.layout_line(text, font_size, runs)
+        }
+    }
+
+    fn sweep_weight(phase: f32, x: f32) -> f32 {
+        (1. - (x - phase).abs() * 4.).max(0.)
+    }
+
+    /// A line of text swept at presentation time, at half opacity, counting
+    /// renders and presented frames.
+    struct SweptText {
+        renders: Rc<Cell<u32>>,
+        presents: Rc<Cell<u32>>,
+    }
+
+    impl Render for SweptText {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let presents = self.presents.clone();
+            div()
+                .size_full()
+                .text_color(crate::black())
+                .child(
+                    div()
+                        .opacity(0.5)
+                        .child(crate::StyledText::new("abcd").sweep(
+                            crate::PresentAnimation::sweep(
+                                std::time::Duration::from_millis(1500),
+                                crate::white(),
+                                sweep_weight,
+                                std::time::Duration::ZERO,
+                            ),
+                        )),
+                )
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            window.on_present(move || presents.set(presents.get() + 1));
+                        },
+                    )
+                    .size_full(),
+                )
+        }
+    }
+
+    fn swept_text_window(
+        reduce_motion: bool,
+    ) -> (
+        crate::TestApp,
+        crate::TestAppWindow<SweptText>,
+        crate::TestWindow,
+        Rc<Cell<u32>>,
+        Rc<Cell<u32>>,
+    ) {
+        let mut app = crate::TestApp::with_text_system(std::sync::Arc::new(VisibleGlyphs(
+            crate::NoopTextSystem,
+        )));
+        app.update(|cx| cx.set_reduce_motion(reduce_motion));
+        let renders = Rc::new(Cell::new(0));
+        let presents = Rc::new(Cell::new(0));
+        let mut window = app.open_window({
+            let renders = renders.clone();
+            let presents = presents.clone();
+            move |_, _| SweptText { renders, presents }
+        });
+        let platform = window.update(|_, window, _| {
+            window.active.set(true);
+            window.platform_window.as_test().unwrap().clone()
+        });
+        (app, window, platform, renders, presents)
+    }
+
+    #[test]
+    fn swept_text_registers_every_glyph_and_presents_without_rendering() {
+        let (_app, mut window, platform, renders, presents) = swept_text_window(false);
+        assert!(platform.simulate_display_tick(), "first frame draws");
+        let (renders_before, presents_before) = (renders.get(), presents.get());
+        assert!(presents_before >= 1);
+
+        let glyphs = window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| {
+                    let animation = scene.sprite_animations[sprite.pad as usize - 1];
+                    (sprite.bounds.origin.x.0, sprite.color, animation)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(glyphs.len(), 4, "one animated sprite per glyph");
+        let mut glyphs = glyphs;
+        glyphs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Four equal advances: centers at 1/8, 3/8, 5/8 and 7/8 of the line.
+        let positions = glyphs
+            .iter()
+            .map(|(_, _, animation)| animation.position)
+            .collect::<Vec<_>>();
+        for (actual, expected) in positions.iter().zip([0.125, 0.375, 0.625, 0.875]) {
+            assert!((actual - expected).abs() < 1e-4, "{positions:?}");
+        }
+        for (_, _, animation) in &glyphs {
+            // Painted (and highlighted) at the element's half opacity.
+            assert!((animation.color.a - 0.5).abs() < 1e-4);
+            let crate::PresentMotion::Sweep { to, .. } = animation.animation.motion else {
+                panic!("expected a sweep");
+            };
+            assert!((to.a - 0.5).abs() < 1e-4);
+        }
+
+        for _ in 0..4 {
+            assert!(
+                platform.simulate_display_tick(),
+                "a live sweep must keep frames coming"
+            );
+        }
+        assert_eq!(presents.get(), presents_before + 4, "every tick presents");
+        assert_eq!(renders.get(), renders_before, "presenting must not render");
+    }
+
+    #[test]
+    fn reduced_motion_paints_swept_text_still() {
+        let (_app, mut window, platform, _renders, _presents) = swept_text_window(true);
+        assert!(platform.simulate_display_tick());
+        let (sprites, animated, alpha) = window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            (
+                scene.monochrome_sprites.len(),
+                scene.has_present_animations(),
+                scene.monochrome_sprites[0].color.a,
+            )
+        });
+        assert_eq!(sprites, 4, "the text is still painted");
+        assert!(!animated);
+        assert!((alpha - 0.5).abs() < 1e-4);
+        assert!(
+            !platform.simulate_display_tick(),
+            "reduced motion must not keep the window presenting"
+        );
+    }
+
+    #[test]
+    fn animation_frames_follow_the_interval_with_tick_jitter() {
+        let interval = std::time::Duration::from_micros(33333);
+        let last = super::Instant::now();
+        assert!(super::animation_frame_due(None, last, interval));
+        assert!(!super::animation_frame_due(
+            Some(last),
+            last + std::time::Duration::from_micros(16667),
+            interval
+        ));
+        // A 60 Hz tick landing a little early still makes the frame.
+        assert!(super::animation_frame_due(
+            Some(last),
+            last + std::time::Duration::from_micros(32000),
+            interval
+        ));
+        assert!(super::animation_frame_due(
+            Some(last),
+            last + std::time::Duration::from_micros(33334),
+            interval
+        ));
     }
 
     struct FocusForwarder {
