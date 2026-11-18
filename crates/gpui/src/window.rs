@@ -4427,6 +4427,7 @@ impl Window {
                 } else {
                     position.clamp(0., 1.)
                 },
+                extent: bounds.size,
             });
 
             if subpixel_rendering {
@@ -4642,6 +4643,7 @@ impl Window {
                     pivot: bounds.center(),
                     color: sprite.color,
                     position: 0.5,
+                    extent: bounds.size,
                 },
             ),
             None => self.next_frame.scene.insert_primitive(sprite),

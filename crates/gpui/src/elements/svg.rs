@@ -70,6 +70,21 @@ impl Svg {
         self.with_present_animation(PresentAnimation::pulse(period, frame_interval))
     }
 
+    /// Move the SVG continuously along `path` once per `period`, presenting at
+    /// most one new frame per `frame_interval`. Offsets are fractions of the
+    /// SVG's own size; see [`crate::PresentMotion::Travel`]. Resolved when the
+    /// window presents a frame, like [`Self::spin`]; with
+    /// [`App::reduce_motion`] set the SVG is painted where it was laid out.
+    /// It does not affect layout or hit testing.
+    pub fn travel(
+        self,
+        period: Duration,
+        path: crate::TravelPath,
+        frame_interval: Duration,
+    ) -> Self {
+        self.with_present_animation(PresentAnimation::travel(period, path, frame_interval))
+    }
+
     /// Attach a [`PresentAnimation`] resolved at presentation time. See
     /// [`Self::spin`].
     pub fn with_present_animation(mut self, animation: PresentAnimation) -> Self {

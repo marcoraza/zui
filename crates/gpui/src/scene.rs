@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point, size,
 };
 use std::{
     fmt::Debug,
@@ -911,14 +911,41 @@ pub enum PresentMotion {
         /// cheap to evaluate for every glyph on every presented frame.
         weight: SweepWeight,
     },
+    /// Continuous movement of a sprite along a path: at every presented
+    /// frame the sprite is moved by `path(phase).offset` and scaled by
+    /// `path(phase).scale` around its own center, where `phase` is where the
+    /// wall clock is inside `period` (`0..1`). Offsets are fractions of the
+    /// sprite's painted size, so one path serves every size. Every travel with
+    /// the same period moves in sync.
+    Travel {
+        /// Duration of one full trip along `path`.
+        period: Duration,
+        /// Where the sprite is at each phase. A plain function, so the motion
+        /// stays `Copy` and cheap to evaluate on every presented frame.
+        path: TravelPath,
+    },
 }
+
+/// Where a [`PresentMotion::Travel`] puts its sprite at one phase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TravelPose {
+    /// Displacement from where the sprite was painted, as a fraction of its
+    /// painted width (`x`) and height (`y`).
+    pub offset: Point<f32>,
+    /// Uniform scale around the sprite's center; `1.0` keeps its size.
+    pub scale: f32,
+}
+
+/// The curve of a [`PresentMotion::Travel`]: the sprite's pose at `phase`,
+/// in `0..1`.
+pub type TravelPath = fn(phase: f32) -> TravelPose;
 
 /// The curve of a [`PresentMotion::Sweep`]: `weight(phase, x)`, both
 /// arguments in `0..1`, returning how far toward the highlight color the
 /// glyph at `x` is at `phase` (clamped to `0..1`).
 pub type SweepWeight = fn(phase: f32, x: f32) -> f32;
 
-/// Equality compares a sweep's weight function by address, which is only a
+/// Equality compares a sweep's weight function (and a travel's path) by address, which is only a
 /// best effort: the same function may have two addresses (or two functions
 /// one), so equal motions may compare unequal. Nothing in the engine relies
 /// on it.
@@ -939,6 +966,16 @@ impl PartialEq for PresentMotion {
                     weight: b_weight,
                 },
             ) => a_period == b_period && a_to == b_to && std::ptr::fn_addr_eq(*a_weight, *b_weight),
+            (
+                Self::Travel {
+                    period: a_period,
+                    path: a_path,
+                },
+                Self::Travel {
+                    period: b_period,
+                    path: b_path,
+                },
+            ) => a_period == b_period && std::ptr::fn_addr_eq(*a_path, *b_path),
             _ => false,
         }
     }
@@ -987,12 +1024,22 @@ impl PresentAnimation {
         }
     }
 
+    /// A sprite moving along `path` once per `period`, at most one frame per
+    /// `frame_interval`. See [`PresentMotion::Travel`].
+    pub fn travel(period: Duration, path: TravelPath, frame_interval: Duration) -> Self {
+        Self {
+            motion: PresentMotion::Travel { period, path },
+            frame_interval,
+        }
+    }
+
     /// Whether this animation can never change what is on screen.
     pub fn is_static(&self) -> bool {
         match self.motion {
             PresentMotion::Spin { period }
             | PresentMotion::Pulse { period }
-            | PresentMotion::Sweep { period, .. } => period.is_zero(),
+            | PresentMotion::Sweep { period, .. }
+            | PresentMotion::Travel { period, .. } => period.is_zero(),
         }
     }
 
@@ -1018,6 +1065,9 @@ pub(crate) struct SpriteAnimation {
     /// Where the sprite sits along its text, in `0..1`; only
     /// [`PresentMotion::Sweep`] reads it.
     pub(crate) position: f32,
+    /// The sprite's painted size, in scaled pixels; only
+    /// [`PresentMotion::Travel`] reads it.
+    pub(crate) extent: Size<ScaledPixels>,
 }
 
 impl SpriteAnimation {
@@ -1041,6 +1091,27 @@ impl SpriteAnimation {
                         )),
                 )
             }
+            PresentMotion::Travel { period, path } => {
+                let Some(phase) = wall_clock_phase(since_epoch, period) else {
+                    return self.base;
+                };
+                let pose = path(phase);
+                let finite = |v: f32| if v.is_finite() { v } else { 0. };
+                let scale = if pose.scale.is_finite() { pose.scale.max(0.) } else { 1. };
+                let at = point(
+                    ScaledPixels(self.pivot.x.0 + finite(pose.offset.x) * self.extent.width.0),
+                    ScaledPixels(self.pivot.y.0 + finite(pose.offset.y) * self.extent.height.0),
+                );
+                self.base.compose(
+                    TransformationMatrix::unit()
+                        .translate(at)
+                        .scale(size(scale, scale))
+                        .translate(point(
+                            ScaledPixels(-self.pivot.x.0),
+                            ScaledPixels(-self.pivot.y.0),
+                        )),
+                )
+            }
             PresentMotion::Pulse { .. } | PresentMotion::Sweep { .. } => self.base,
         }
     }
@@ -1048,7 +1119,7 @@ impl SpriteAnimation {
     /// The sprite's color at `since_epoch`.
     pub(crate) fn color_at(&self, since_epoch: Duration) -> Hsla {
         match self.animation.motion {
-            PresentMotion::Spin { .. } => self.color,
+            PresentMotion::Spin { .. } | PresentMotion::Travel { .. } => self.color,
             PresentMotion::Pulse { period } => {
                 let Some(phase) = wall_clock_phase(since_epoch, period) else {
                     return self.color;
@@ -1395,6 +1466,7 @@ mod tests {
             pivot: point(ScaledPixels(10.), ScaledPixels(10.)),
             color: Hsla::default(),
             position: 0.,
+            extent: Size::default(),
         }
     }
 
@@ -1455,6 +1527,44 @@ mod tests {
         assert_eq!(
             still.transformation_at(Duration::from_millis(1_700_000_000_250)),
             TransformationMatrix::unit()
+        );
+    }
+
+    #[test]
+    fn travel_moves_and_scales_around_the_sprite_center() {
+        fn path(phase: f32) -> TravelPose {
+            TravelPose {
+                offset: point(phase, -phase),
+                scale: 1. + phase,
+            }
+        }
+        let travel = SpriteAnimation {
+            animation: PresentAnimation::travel(
+                Duration::from_millis(1000),
+                path,
+                Duration::from_millis(33),
+            ),
+            pivot: point(ScaledPixels(10.), ScaledPixels(5.)),
+            extent: size(ScaledPixels(20.), ScaledPixels(10.)),
+            ..spin_animation(TransformationMatrix::unit())
+        };
+        // Half way: moved by half its width right and half its height up,
+        // and 1.5 times its size around the moved center.
+        let at = travel.transformation_at(Duration::from_millis(1_700_000_000_500));
+        assert_eq!(at.apply(point(px(10.), px(5.))), point(px(20.), px(0.)));
+        assert_eq!(at.apply(point(px(20.), px(5.))), point(px(35.), px(0.)));
+        // Start of the trip: where it was painted.
+        assert_eq!(
+            travel.transformation_at(Duration::from_millis(1_700_000_000_000)),
+            TransformationMatrix::unit()
+                .translate(point(ScaledPixels(10.), ScaledPixels(5.)))
+                .scale(size(1., 1.))
+                .translate(point(ScaledPixels(-10.), ScaledPixels(-5.)))
+        );
+        // A travel never touches the color.
+        assert_eq!(
+            travel.color_at(Duration::from_millis(1_700_000_000_500)),
+            travel.color
         );
     }
 
