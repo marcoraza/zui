@@ -1,3 +1,6 @@
+// Keep the DirectX structured-buffer ABI in sync with gpui scene primitives
+// and implement their scoped EdgeFade effect.
+
 #include "alpha_correction.hlsl"
 
 cbuffer GlobalParams: register(b0) {
@@ -34,6 +37,18 @@ struct Edges {
     float right;
     float bottom;
     float left;
+};
+
+// Mirrors gpui::EdgeFadeParams exactly (8 x f32, 32 bytes).
+struct EdgeFadeParams {
+    float top_y;
+    float bottom_y;
+    float band_top;
+    float band_bottom;
+    float left_x;
+    float right_x;
+    float band_left;
+    float band_right;
 };
 
 struct Hsla {
@@ -118,6 +133,25 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
     float2 position = unit_vertex * bounds.size + bounds.origin;
     float2 transformed = mul(position, transformation.rotation_scale) + transformation.translation;
     return distance_from_clip_rect_impl(transformed, clip_bounds);
+}
+
+// Per-pixel scoped edge fade. A zero band disables that edge and a zeroed
+// struct is a no-op. Squaring matches gpui's CPU, Metal, and WGPU curves.
+float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
+    float ramp = 1.0;
+    if (fade.band_top > 0.0) {
+        ramp = min(ramp, clamp((position.y - fade.top_y) / fade.band_top, 0.0, 1.0));
+    }
+    if (fade.band_bottom > 0.0) {
+        ramp = min(ramp, clamp((fade.bottom_y - position.y) / fade.band_bottom, 0.0, 1.0));
+    }
+    if (fade.band_left > 0.0) {
+        ramp = min(ramp, clamp((position.x - fade.left_x) / fade.band_left, 0.0, 1.0));
+    }
+    if (fade.band_right > 0.0) {
+        ramp = min(ramp, clamp((fade.right_x - position.x) / fade.band_right, 0.0, 1.0));
+    }
+    return ramp * ramp;
 }
 
 // Convert linear RGB to sRGB
@@ -502,6 +536,7 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    EdgeFadeParams fade;
 };
 
 struct QuadVertexOutput {
@@ -554,6 +589,9 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+
+    float edge_fade = edge_fade_alpha(input.position.xy, quad.fade);
+    background_color.a *= edge_fade;
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -661,6 +699,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
         float4 border_color = input.border_color;
+        border_color.a *= edge_fade;
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash
@@ -1201,6 +1240,28 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 **
 */
 
+struct ImageAlphaMaskParams {
+    Bounds bounds;
+    float radius;
+    float feather;
+    float clearance;
+    float bottom_y;
+    float bottom_feather;
+    float pad;
+};
+
+float image_mask_alpha(float2 position, ImageAlphaMaskParams mask) {
+    if (mask.feather <= 0.0) return 1.0;
+    float2 half_size = mask.bounds.size * 0.5;
+    float2 center = mask.bounds.origin + half_size;
+    float2 q = abs(position - center) - half_size + mask.radius;
+    float distance = length(max(q, float2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - mask.radius;
+    float alpha = smoothstep(0.0, mask.feather, distance - mask.clearance);
+    if (mask.bottom_feather > 0.0)
+        alpha = min(alpha, smoothstep(0.0, mask.bottom_feather, mask.bottom_y - position.y));
+    return alpha;
+}
+
 struct PolychromeSprite {
     uint order;
     uint pad;
@@ -1209,6 +1270,8 @@ struct PolychromeSprite {
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    EdgeFadeParams fade;
+    ImageAlphaMaskParams alpha_mask;
     AtlasTile tile;
 };
 
@@ -1253,6 +1316,92 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
-    color.a *= sprite.opacity * saturate(0.5 - distance);
+    color.a *= sprite.opacity * saturate(0.5 - distance)
+        * edge_fade_alpha(input.position.xy, sprite.fade)
+        * image_mask_alpha(input.position.xy, sprite.alpha_mask);
     return color;
+}
+
+// Lazy within-window backdrop passes. b1 mirrors directx_renderer/backdrop.rs.
+cbuffer BackdropParams: register(b1) {
+    Bounds backdrop_bounds;
+    Corners backdrop_corners;
+    Bounds backdrop_clip;
+    float4 backdrop_source;
+    float4 backdrop_kernel;
+    float4 backdrop_weights[33];
+};
+
+struct BackdropVertex {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+};
+
+BackdropVertex backdrop_pass_vertex(uint vertex_id: SV_VertexID) {
+    float2 uv = float2(vertex_id & 1u, (vertex_id >> 1u) & 1u);
+    BackdropVertex output;
+    output.position = float4(uv * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+    output.uv = uv;
+    return output;
+}
+
+float4 backdrop_pass_fragment(BackdropVertex input): SV_Target {
+    // Defense in depth: bound the dynamic loop before converting to int.
+    // Matches MAX_SIGMA in directx_renderer/backdrop.rs.
+    float sigma = clamp(backdrop_kernel.z, 1., 64.);
+    int radius = min(int(ceil(3. * sigma)), 192);
+    float2 step_uv = backdrop_kernel.xy;
+    float4 sum = 0.;
+    if (radius <= 128) {
+        if (backdrop_kernel.w == 1.) {
+            // Combine neighboring taps using linear filtering at unit stride.
+            sum = t_sprite.SampleLevel(s_sprite, input.uv, 0.) * backdrop_weights[0].x;
+            [loop] for (int k = 1; k <= radius; k += 2) {
+                uint index = uint(k);
+                float a = backdrop_weights[index >> 2u][index & 3u];
+                float b = backdrop_weights[(index + 1u) >> 2u][(index + 1u) & 3u];
+                float weight = a + b;
+                float2 offset = (float(k) + b / weight) * step_uv;
+                sum += t_sprite.SampleLevel(s_sprite, input.uv + offset, 0.) * weight;
+                sum += t_sprite.SampleLevel(s_sprite, input.uv - offset, 0.) * weight;
+            }
+        } else {
+            [loop] for (int k = -radius; k <= radius; ++k) {
+                uint index = uint(abs(k));
+                float weight = backdrop_weights[index >> 2u][index & 3u];
+                sum += t_sprite.SampleLevel(s_sprite, input.uv + float(k) * step_uv, 0.) * weight;
+            }
+        }
+        return sum;
+    }
+    // Compute uncached weights, with a hard maximum of 385 samples per pixel.
+    float total_weight = 0.;
+    [loop] for (int k = -radius; k <= radius; ++k) {
+        float weight = exp(-float(k) * float(k) / (2. * sigma * sigma));
+        sum += t_sprite.SampleLevel(s_sprite, input.uv + float(k) * step_uv, 0.) * weight;
+        total_weight += weight;
+    }
+    return sum / total_weight;
+}
+
+BackdropVertex backdrop_composite_vertex(uint vertex_id: SV_VertexID) {
+    float2 uv = float2(vertex_id & 1u, (vertex_id >> 1u) & 1u);
+    BackdropVertex output;
+    float2 position = backdrop_bounds.origin + uv * backdrop_bounds.size;
+    output.position = float4(position / global_viewport_size * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+    output.uv = uv;
+    return output;
+}
+
+float4 backdrop_composite_fragment(BackdropVertex input): SV_Target {
+    float2 position = input.position.xy;
+    // Blending is disabled. Discard outside the mask/rounded bounds instead
+    // of returning transparent black, which would erase the existing frame.
+    if (any(position < backdrop_clip.origin) || any(position >= backdrop_clip.origin + backdrop_clip.size)
+        || quad_sdf(position, backdrop_bounds, backdrop_corners) > 0.) {
+        discard;
+    }
+    float2 uv = (position - backdrop_source.xy) / backdrop_source.zw;
+    // The entire sampled RGBA is premultiplied; do not multiply alpha again.
+    return t_sprite.SampleLevel(s_sprite, uv, 0.);
 }
