@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    time::Duration,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -54,6 +55,11 @@ pub struct Scene {
     /// stream: the renderer breaks its render pass at each blur's order to
     /// snapshot the framebuffer (macOS Metal; other renderers ignore them).
     pub backdrop_blurs: Vec<BackdropBlur>,
+    /// Animations resolved at presentation time, indexed by
+    /// `MonochromeSprite::pad - 1` or `SubpixelSprite::pad - 1`. The id
+    /// travels inside the sprite, so it survives `finish`'s sorting; `replay`
+    /// re-registers it.
+    pub(crate) sprite_animations: Vec<SpriteAnimation>,
 }
 
 #[expect(missing_docs)]
@@ -71,6 +77,7 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        self.sprite_animations.clear();
     }
 
     /// Whether there are no drawable operations, ignoring empty layer markers.
@@ -165,9 +172,57 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Insert a monochrome sprite whose transformation is recomputed every
+    /// time the frame is presented, without repainting.
+    pub(crate) fn insert_animated_monochrome_sprite(
+        &mut self,
+        mut sprite: MonochromeSprite,
+        animation: SpriteAnimation,
+    ) {
+        self.sprite_animations.push(animation);
+        sprite.pad = self.sprite_animations.len() as u32;
+        let sprite_count = self.monochrome_sprites.len();
+        self.insert_primitive(sprite);
+        if self.monochrome_sprites.len() == sprite_count {
+            // Fully clipped: nothing on screen, nothing to keep presenting.
+            self.sprite_animations.pop();
+        }
+    }
+
+    /// Insert a subpixel (glyph) sprite whose color is recomputed every time
+    /// the frame is presented, without repainting. Shares the animation
+    /// table, and the meaning of `pad`, with monochrome sprites.
+    pub(crate) fn insert_animated_subpixel_sprite(
+        &mut self,
+        mut sprite: SubpixelSprite,
+        animation: SpriteAnimation,
+    ) {
+        self.sprite_animations.push(animation);
+        sprite.pad = self.sprite_animations.len() as u32;
+        let sprite_count = self.subpixel_sprites.len();
+        self.insert_primitive(sprite);
+        if self.subpixel_sprites.len() == sprite_count {
+            // Fully clipped: nothing on screen, nothing to keep presenting.
+            self.sprite_animations.pop();
+        }
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
+                // An animated sprite's id points into the previous scene's
+                // table; carry the animation over and give the sprite an id in
+                // this scene.
+                PaintOperation::Primitive(Primitive::MonochromeSprite(sprite))
+                    if sprite.pad != 0 =>
+                {
+                    let animation = prev_scene.sprite_animations[sprite.pad as usize - 1];
+                    self.insert_animated_monochrome_sprite(*sprite, animation);
+                }
+                PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)) if sprite.pad != 0 => {
+                    let animation = prev_scene.sprite_animations[sprite.pad as usize - 1];
+                    self.insert_animated_subpixel_sprite(*sprite, animation);
+                }
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::BackdropBlur(blur) => self.insert_backdrop_blur(*blur),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
@@ -189,6 +244,56 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+    }
+
+    /// Whether any sprite in this scene animates at presentation time.
+    pub(crate) fn has_present_animations(&self) -> bool {
+        !self.sprite_animations.is_empty()
+    }
+
+    /// The shortest frame interval requested by the scene's animations.
+    pub(crate) fn present_animation_interval(&self) -> Option<Duration> {
+        self.sprite_animations
+            .iter()
+            .map(|animation| animation.animation.frame_interval)
+            .min()
+    }
+
+    /// Rewrite the transformation of every animated sprite for the given
+    /// wall-clock time (time since the Unix epoch).
+    ///
+    /// Both the sorted sprites (what renderers draw) and the recorded paint
+    /// operations are updated, because a platform may split the scene by
+    /// replaying those operations (the macOS overlay plane does).
+    pub(crate) fn resolve_present_animations(&mut self, since_epoch: Duration) {
+        if self.sprite_animations.is_empty() {
+            return;
+        }
+        let animations = &self.sprite_animations;
+        let resolve = |pad: u32, transformation: &mut TransformationMatrix, color: &mut Hsla| {
+            if pad != 0 {
+                let animation = &animations[pad as usize - 1];
+                *transformation = animation.transformation_at(since_epoch);
+                *color = animation.color_at(since_epoch);
+            }
+        };
+        for sprite in &mut self.monochrome_sprites {
+            resolve(sprite.pad, &mut sprite.transformation, &mut sprite.color);
+        }
+        for sprite in &mut self.subpixel_sprites {
+            resolve(sprite.pad, &mut sprite.transformation, &mut sprite.color);
+        }
+        for operation in &mut self.paint_operations {
+            match operation {
+                PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) => {
+                    resolve(sprite.pad, &mut sprite.transformation, &mut sprite.color);
+                }
+                PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)) => {
+                    resolve(sprite.pad, &mut sprite.transformation, &mut sprite.color);
+                }
+                _ => {}
+            }
+        }
     }
 
     #[cfg_attr(
@@ -770,11 +875,236 @@ impl Default for TransformationMatrix {
     }
 }
 
+/// Motion that the window resolves when it presents a frame, so a
+/// decorative animation never re-renders, lays out or repaints any view.
+#[derive(Clone, Copy, Debug)]
+pub enum PresentMotion {
+    /// Continuous, linear, clockwise rotation around the sprite's center,
+    /// one full turn per `period`. The phase comes from the wall clock, so
+    /// every spinner on screen with the same period turns in sync.
+    Spin {
+        /// Duration of one full turn.
+        period: Duration,
+    },
+    /// Continuous opacity pulse: the sprite's alpha follows
+    /// `0.5 - 0.5 * cos(phase)`, from invisible to the alpha it was painted
+    /// with and back, once per `period`. The phase comes from the wall
+    /// clock, so every pulse with the same period breathes in sync.
+    Pulse {
+        /// Duration of one full pulse.
+        period: Duration,
+    },
+    /// Continuous highlight sweeping across a text: each glyph's color is
+    /// `mix(painted, to, weight(phase, x))`, where `phase` is where the wall
+    /// clock is inside `period` (`0..1`) and `x` is where the glyph's center
+    /// sits along the text (`0..1`, see [`crate::StyledText::sweep`]). The
+    /// mix interpolates in sRGB with premultiplied alpha. Every sweep with the
+    /// same period moves in sync.
+    Sweep {
+        /// Duration of one full cycle of `weight`.
+        period: Duration,
+        /// The color a glyph reaches at weight 1. Scaled by the opacity the
+        /// glyph is painted with, like the glyph's own color.
+        to: Hsla,
+        /// How far each glyph is toward `to`, in `0..1`, as a function of
+        /// `(phase, x)`. A plain function, so the motion stays `Copy` and
+        /// cheap to evaluate for every glyph on every presented frame.
+        weight: SweepWeight,
+    },
+}
+
+/// The curve of a [`PresentMotion::Sweep`]: `weight(phase, x)`, both
+/// arguments in `0..1`, returning how far toward the highlight color the
+/// glyph at `x` is at `phase` (clamped to `0..1`).
+pub type SweepWeight = fn(phase: f32, x: f32) -> f32;
+
+/// Equality compares a sweep's weight function by address, which is only a
+/// best effort: the same function may have two addresses (or two functions
+/// one), so equal motions may compare unequal. Nothing in the engine relies
+/// on it.
+impl PartialEq for PresentMotion {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Spin { period: a }, Self::Spin { period: b })
+            | (Self::Pulse { period: a }, Self::Pulse { period: b }) => a == b,
+            (
+                Self::Sweep {
+                    period: a_period,
+                    to: a_to,
+                    weight: a_weight,
+                },
+                Self::Sweep {
+                    period: b_period,
+                    to: b_to,
+                    weight: b_weight,
+                },
+            ) => a_period == b_period && a_to == b_to && std::ptr::fn_addr_eq(*a_weight, *b_weight),
+            _ => false,
+        }
+    }
+}
+
+/// A [`PresentMotion`] plus how often it needs a new frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PresentAnimation {
+    /// What moves.
+    pub motion: PresentMotion,
+    /// Minimum time between two presented frames for this animation.
+    pub frame_interval: Duration,
+}
+
+impl PresentAnimation {
+    /// A continuous spin: one turn per `period`, at most one frame per
+    /// `frame_interval`.
+    pub fn spin(period: Duration, frame_interval: Duration) -> Self {
+        Self {
+            motion: PresentMotion::Spin { period },
+            frame_interval,
+        }
+    }
+
+    /// A continuous opacity pulse: one breath per `period`, at most one
+    /// frame per `frame_interval`.
+    pub fn pulse(period: Duration, frame_interval: Duration) -> Self {
+        Self {
+            motion: PresentMotion::Pulse { period },
+            frame_interval,
+        }
+    }
+
+    /// A highlight sweeping across a text toward `to`, following `weight`
+    /// once per `period`, at most one frame per `frame_interval`. See
+    /// [`PresentMotion::Sweep`].
+    pub fn sweep(
+        period: Duration,
+        to: Hsla,
+        weight: SweepWeight,
+        frame_interval: Duration,
+    ) -> Self {
+        Self {
+            motion: PresentMotion::Sweep { period, to, weight },
+            frame_interval,
+        }
+    }
+
+    /// Whether this animation can never change what is on screen.
+    pub fn is_static(&self) -> bool {
+        match self.motion {
+            PresentMotion::Spin { period }
+            | PresentMotion::Pulse { period }
+            | PresentMotion::Sweep { period, .. } => period.is_zero(),
+        }
+    }
+
+    /// This animation for a sprite painted at `opacity`: colors the motion
+    /// introduces get the same opacity as the sprite's own color.
+    pub(crate) fn with_opacity(mut self, opacity: f32) -> Self {
+        if let PresentMotion::Sweep { to, .. } = &mut self.motion {
+            *to = to.opacity(opacity);
+        }
+        self
+    }
+}
+
+/// A [`PresentAnimation`] bound to one sprite: the transformation it was
+/// painted with and the point it moves around, in scaled pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpriteAnimation {
+    pub(crate) animation: PresentAnimation,
+    pub(crate) base: TransformationMatrix,
+    pub(crate) pivot: Point<ScaledPixels>,
+    /// The color the sprite was painted with.
+    pub(crate) color: Hsla,
+    /// Where the sprite sits along its text, in `0..1`; only
+    /// [`PresentMotion::Sweep`] reads it.
+    pub(crate) position: f32,
+}
+
+impl SpriteAnimation {
+    /// The sprite's transformation at `since_epoch` (wall-clock time since
+    /// the Unix epoch). The motion is applied in the sprite's own space,
+    /// before the static transformation it was painted with.
+    pub(crate) fn transformation_at(&self, since_epoch: Duration) -> TransformationMatrix {
+        match self.animation.motion {
+            PresentMotion::Spin { period } => {
+                let Some(phase) = wall_clock_phase(since_epoch, period) else {
+                    return self.base;
+                };
+                let angle = Radians(phase * std::f32::consts::TAU);
+                self.base.compose(
+                    TransformationMatrix::unit()
+                        .translate(self.pivot)
+                        .rotate(angle)
+                        .translate(point(
+                            ScaledPixels(-self.pivot.x.0),
+                            ScaledPixels(-self.pivot.y.0),
+                        )),
+                )
+            }
+            PresentMotion::Pulse { .. } | PresentMotion::Sweep { .. } => self.base,
+        }
+    }
+
+    /// The sprite's color at `since_epoch`.
+    pub(crate) fn color_at(&self, since_epoch: Duration) -> Hsla {
+        match self.animation.motion {
+            PresentMotion::Spin { .. } => self.color,
+            PresentMotion::Pulse { period } => {
+                let Some(phase) = wall_clock_phase(since_epoch, period) else {
+                    return self.color;
+                };
+                let wave = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+                self.color.opacity(wave)
+            }
+            PresentMotion::Sweep { period, to, weight } => {
+                let Some(phase) = wall_clock_phase(since_epoch, period) else {
+                    return self.color;
+                };
+                let weight = weight(phase, self.position);
+                mix_premultiplied(self.color, to, if weight.is_nan() { 0. } else { weight })
+            }
+        }
+    }
+}
+
+/// Interpolate from `from` to `to` in sRGB with premultiplied alpha, so a
+/// translucent end does not drag the other end's hue toward black.
+/// `t <= 0` returns `from` and `t >= 1` returns `to` exactly.
+fn mix_premultiplied(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    if t <= 0. {
+        return from;
+    }
+    if t >= 1. {
+        return to;
+    }
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    let (f, g) = (Rgba::from(from), Rgba::from(to));
+    let a = lerp(f.a, g.a);
+    if a <= f32::EPSILON {
+        return Hsla::from(Rgba { a: 0., ..g });
+    }
+    Hsla::from(Rgba {
+        r: lerp(f.r * f.a, g.r * g.a) / a,
+        g: lerp(f.g * f.a, g.g * g.a) / a,
+        b: lerp(f.b * f.a, g.b * g.a) / a,
+        a,
+    })
+}
+
+/// Where the wall clock is inside a cycle of `period`, in `0..1`; `None` for
+/// a zero period.
+fn wall_clock_phase(since_epoch: Duration, period: Duration) -> Option<f32> {
+    let period_ms = period.as_millis();
+    (period_ms != 0).then(|| (since_epoch.as_millis() % period_ms) as f32 / period_ms as f32)
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
+    /// Zero, or `1 +` the index of this sprite's presentation-time animation
+    /// in its [`Scene`]. Alignment padding for the GPU; no shader reads it.
     pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
@@ -794,7 +1124,10 @@ impl From<MonochromeSprite> for Primitive {
 #[expect(missing_docs)]
 pub struct SubpixelSprite {
     pub order: DrawOrder,
-    pub pad: u32, // align to 8 bytes
+    /// Zero, or `1 +` the index of this sprite's presentation-time animation
+    /// in its [`Scene`], like [`MonochromeSprite::pad`]. Alignment padding
+    /// for the GPU (align to 8 bytes); no shader reads it.
+    pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
@@ -1011,5 +1344,482 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AtlasTextureId, AtlasTextureKind, DevicePixels, TileId, px};
+
+    fn sprite(tile_id: u32) -> MonochromeSprite {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: Size {
+                width: ScaledPixels(20.),
+                height: ScaledPixels(20.),
+            },
+        };
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            color: Hsla::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(tile_id),
+                padding: 0,
+                bounds: Bounds {
+                    origin: point(DevicePixels(0), DevicePixels(0)),
+                    size: Size {
+                        width: DevicePixels(20),
+                        height: DevicePixels(20),
+                    },
+                },
+            },
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn spin_animation(base: TransformationMatrix) -> SpriteAnimation {
+        SpriteAnimation {
+            animation: PresentAnimation::spin(
+                Duration::from_millis(1000),
+                Duration::from_millis(33),
+            ),
+            base,
+            pivot: point(ScaledPixels(10.), ScaledPixels(10.)),
+            color: Hsla::default(),
+            position: 0.,
+        }
+    }
+
+    fn assert_close(actual: Point<Pixels>, expected: Point<Pixels>) {
+        assert!(
+            (actual.x.0 - expected.x.0).abs() < 1e-3 && (actual.y.0 - expected.y.0).abs() < 1e-3,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn spin_matrix_follows_the_wall_clock() {
+        let animation = spin_animation(TransformationMatrix::unit());
+        // A whole number of periods since the epoch: no rotation.
+        assert_close(
+            animation
+                .transformation_at(Duration::from_millis(1_700_000_000_000))
+                .apply(point(px(20.), px(10.))),
+            point(px(20.), px(10.)),
+        );
+        // A quarter period later: a quarter turn clockwise around the pivot
+        // (y grows downward), so the point right of the pivot moves below it.
+        let quarter = animation.transformation_at(Duration::from_millis(1_700_000_000_250));
+        assert_close(
+            quarter.apply(point(px(20.), px(10.))),
+            point(px(10.), px(20.)),
+        );
+        assert_close(
+            quarter.apply(point(px(10.), px(10.))),
+            point(px(10.), px(10.)),
+        );
+        // Half a period: opposite side.
+        assert_close(
+            animation
+                .transformation_at(Duration::from_millis(1_700_000_000_500))
+                .apply(point(px(20.), px(10.))),
+            point(px(0.), px(10.)),
+        );
+
+        // The static transformation it was painted with still applies, after
+        // the spin.
+        let shifted = spin_animation(
+            TransformationMatrix::unit().translate(point(ScaledPixels(5.), ScaledPixels(0.))),
+        );
+        assert_close(
+            shifted
+                .transformation_at(Duration::from_millis(1_700_000_000_250))
+                .apply(point(px(20.), px(10.))),
+            point(px(15.), px(20.)),
+        );
+
+        // A zero period never moves and never divides by zero.
+        let still = SpriteAnimation {
+            animation: PresentAnimation::spin(Duration::ZERO, Duration::from_millis(33)),
+            ..animation
+        };
+        assert!(still.animation.is_static());
+        assert_eq!(
+            still.transformation_at(Duration::from_millis(1_700_000_000_250)),
+            TransformationMatrix::unit()
+        );
+    }
+
+    #[test]
+    fn pulse_alpha_follows_the_wall_clock() {
+        let painted = Hsla {
+            h: 0.,
+            s: 0.,
+            l: 1.,
+            a: 0.5,
+        };
+        let pulse = SpriteAnimation {
+            animation: PresentAnimation::pulse(
+                Duration::from_millis(1000),
+                Duration::from_millis(33),
+            ),
+            color: painted,
+            ..spin_animation(TransformationMatrix::unit())
+        };
+        let alpha = |ms: u64| pulse.color_at(Duration::from_millis(ms)).a;
+        // Start of a cycle: invisible. Half way: the painted alpha. Quarter: half of it.
+        assert!(alpha(1_700_000_000_000).abs() < 1e-4);
+        assert!((alpha(1_700_000_000_500) - 0.5).abs() < 1e-4);
+        assert!((alpha(1_700_000_000_250) - 0.25).abs() < 1e-4);
+        // A pulse never moves the sprite, and a spin never recolors it.
+        assert_eq!(
+            pulse.transformation_at(Duration::from_millis(1_700_000_000_250)),
+            TransformationMatrix::unit()
+        );
+        let mut spin = spin_animation(TransformationMatrix::unit());
+        spin.color = painted;
+        assert_eq!(
+            spin.color_at(Duration::from_millis(1_700_000_000_250)),
+            painted
+        );
+
+        // Resolving a scene applies it to the sprite the renderer draws.
+        let mut scene = Scene::default();
+        let mut pulsing = sprite(1);
+        pulsing.color = painted;
+        scene.insert_animated_monochrome_sprite(pulsing, pulse);
+        scene.finish();
+        scene.resolve_present_animations(Duration::from_millis(1_700_000_000_250));
+        assert!((scene.monochrome_sprites[0].color.a - 0.25).abs() < 1e-4);
+    }
+
+    /// Resolve at a quarter turn and return (tile id, transformed probe point)
+    /// for every monochrome sprite.
+    fn resolved(scene: &mut Scene) -> Vec<(u32, Point<Pixels>)> {
+        scene.resolve_present_animations(Duration::from_millis(1_700_000_000_250));
+        scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| {
+                (
+                    sprite.tile.tile_id.0,
+                    sprite.transformation.apply(point(px(20.), px(10.))),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_only_tile_7_spins(resolved: &[(u32, Point<Pixels>)]) {
+        assert_eq!(resolved.len(), 2);
+        for (tile_id, probe) in resolved {
+            if *tile_id == 7 {
+                assert_close(*probe, point(px(10.), px(20.)));
+            } else {
+                assert_close(*probe, point(px(20.), px(10.)));
+            }
+        }
+    }
+
+    #[test]
+    fn spin_survives_sorting_and_replay() {
+        let full = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: Size {
+                width: ScaledPixels(100.),
+                height: ScaledPixels(100.),
+            },
+        };
+        let mut scene = Scene::default();
+        scene.push_layer(full);
+        // Inserted first, but sorts after the static sprite (higher tile id).
+        scene.insert_animated_monochrome_sprite(
+            sprite(7),
+            spin_animation(TransformationMatrix::unit()),
+        );
+        scene.insert_primitive(sprite(1));
+        scene.pop_layer();
+        scene.finish();
+        assert_eq!(scene.monochrome_sprites[0].tile.tile_id, TileId(1));
+        assert!(scene.has_present_animations());
+        assert_eq!(
+            scene.present_animation_interval(),
+            Some(Duration::from_millis(33))
+        );
+        assert_only_tile_7_spins(&resolved(&mut scene));
+
+        // A cached view's paint range is replayed into the next scene.
+        let mut next = Scene::default();
+        next.replay(0..scene.paint_operations.len(), &scene);
+        next.finish();
+        assert!(next.has_present_animations());
+        assert_only_tile_7_spins(&resolved(&mut next));
+
+        // A platform that splits the presented scene by replaying it (the
+        // macOS overlay plane) sees the resolved rotation too.
+        let mut split = Scene::default();
+        split.replay(0..scene.paint_operations.len(), &scene);
+        split.finish();
+        let split_probes = split
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| {
+                (
+                    sprite.tile.tile_id.0,
+                    sprite.transformation.apply(point(px(20.), px(10.))),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_only_tile_7_spins(&split_probes);
+
+        // Replaying only the static part carries no animation.
+        let mut static_only = Scene::default();
+        static_only.replay(2..3, &scene);
+        static_only.finish();
+        assert!(!static_only.has_present_animations());
+
+        // A fully clipped animated sprite leaves nothing behind.
+        let mut clipped = Scene::default();
+        let mut hidden = sprite(9);
+        hidden.content_mask.bounds.size = Size::default();
+        clipped.insert_animated_monochrome_sprite(
+            hidden,
+            spin_animation(TransformationMatrix::unit()),
+        );
+        assert!(!clipped.has_present_animations());
+
+        scene.clear();
+        assert!(!scene.has_present_animations());
+    }
+
+    /// A highlight band a quarter of the text wide on each side, centered on
+    /// `phase`: full at the center, fading linearly to nothing.
+    fn band(phase: f32, x: f32) -> f32 {
+        (1. - (x - phase).abs() * 4.).max(0.)
+    }
+
+    fn opaque(r: f32, g: f32, b: f32) -> Hsla {
+        Hsla::from(Rgba { r, g, b, a: 1. })
+    }
+
+    fn assert_rgba_close(actual: Hsla, expected: Rgba) {
+        let actual = Rgba::from(actual);
+        assert!(
+            (actual.r - expected.r).abs() < 1e-3
+                && (actual.g - expected.g).abs() < 1e-3
+                && (actual.b - expected.b).abs() < 1e-3
+                && (actual.a - expected.a).abs() < 1e-3,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    fn sweep_animation(position: f32) -> SpriteAnimation {
+        SpriteAnimation {
+            animation: PresentAnimation::sweep(
+                Duration::from_millis(1000),
+                opaque(1., 1., 1.),
+                band,
+                Duration::from_millis(33),
+            ),
+            color: opaque(0., 0., 0.),
+            position,
+            ..spin_animation(TransformationMatrix::unit())
+        }
+    }
+
+    fn subpixel_sprite(tile_id: u32) -> SubpixelSprite {
+        let sprite = sprite(tile_id);
+        SubpixelSprite {
+            order: 0,
+            pad: 0,
+            bounds: sprite.bounds,
+            content_mask: sprite.content_mask,
+            color: sprite.color,
+            tile: sprite.tile,
+            transformation: sprite.transformation,
+        }
+    }
+
+    #[test]
+    fn sweep_color_follows_the_wall_clock_and_the_glyph_position() {
+        let gray = |v: f32| Rgba {
+            r: v,
+            g: v,
+            b: v,
+            a: 1.,
+        };
+        // Half way through the period the band is centered on the text.
+        let half = Duration::from_millis(1_700_000_000_500);
+        assert_eq!(sweep_animation(0.5).color_at(half), opaque(1., 1., 1.));
+        assert_rgba_close(sweep_animation(0.375).color_at(half), gray(0.5));
+        assert_eq!(sweep_animation(0.).color_at(half), opaque(0., 0., 0.));
+        // A quarter later the band has moved on to the end of the text.
+        let three_quarters = Duration::from_millis(1_700_000_000_750);
+        assert_eq!(
+            sweep_animation(0.5).color_at(three_quarters),
+            opaque(0., 0., 0.)
+        );
+        assert_eq!(
+            sweep_animation(0.75).color_at(three_quarters),
+            opaque(1., 1., 1.)
+        );
+        // A sweep recolors, it never moves the glyph.
+        assert_eq!(
+            sweep_animation(0.5).transformation_at(half),
+            TransformationMatrix::unit()
+        );
+
+        // A zero period is static and keeps the painted color.
+        let mut still = sweep_animation(0.5);
+        still.animation =
+            PresentAnimation::sweep(Duration::ZERO, opaque(1., 1., 1.), band, Duration::ZERO);
+        assert!(still.animation.is_static());
+        assert_eq!(still.color_at(half), opaque(0., 0., 0.));
+
+        // The highlight takes the opacity the glyph was painted with.
+        let mut faded = sweep_animation(0.5);
+        faded.animation = faded.animation.with_opacity(0.5);
+        faded.color = faded.color.opacity(0.5);
+        assert_rgba_close(
+            faded.color_at(half),
+            Rgba {
+                r: 1.,
+                g: 1.,
+                b: 1.,
+                a: 0.5,
+            },
+        );
+        let mut faded_edge = sweep_animation(0.375);
+        faded_edge.animation = faded_edge.animation.with_opacity(0.5);
+        faded_edge.color = faded_edge.color.opacity(0.5);
+        assert_rgba_close(
+            faded_edge.color_at(half),
+            Rgba {
+                r: 0.5,
+                g: 0.5,
+                b: 0.5,
+                a: 0.5,
+            },
+        );
+    }
+
+    #[test]
+    fn sweep_mix_interpolates_with_premultiplied_alpha() {
+        let red = opaque(1., 0., 0.);
+        let clear_white = Hsla::from(Rgba {
+            r: 1.,
+            g: 1.,
+            b: 1.,
+            a: 0.,
+        });
+        // From transparent, the hue is the opaque end's: red at half alpha,
+        // not pink.
+        assert_rgba_close(
+            mix_premultiplied(clear_white, red, 0.5),
+            Rgba {
+                r: 1.,
+                g: 0.,
+                b: 0.,
+                a: 0.5,
+            },
+        );
+        assert_eq!(mix_premultiplied(clear_white, red, 0.), clear_white);
+        assert_eq!(mix_premultiplied(clear_white, red, -1.), clear_white);
+        assert_eq!(mix_premultiplied(clear_white, red, 1.), red);
+        assert_eq!(mix_premultiplied(clear_white, red, 2.), red);
+        // Both ends transparent: transparent, with the target's hue.
+        let clear_red = red.opacity(0.);
+        assert_eq!(mix_premultiplied(clear_white, clear_red, 0.5).a, 0.);
+    }
+
+    #[test]
+    fn sweep_glyphs_resolve_and_survive_replay_in_both_sprite_kinds() {
+        let half = Duration::from_millis(1_700_000_000_500);
+        let mut scene = Scene::default();
+        // Grayscale glyph at the start of the text, subpixel glyph in the
+        // middle, and a static subpixel glyph.
+        scene.insert_animated_monochrome_sprite(sprite(1), sweep_animation(0.));
+        scene.insert_animated_subpixel_sprite(subpixel_sprite(2), sweep_animation(0.5));
+        scene.insert_primitive(subpixel_sprite(3));
+        scene.finish();
+        assert!(scene.has_present_animations());
+        assert_eq!(scene.subpixel_sprites.len(), 2);
+
+        let colors = |scene: &mut Scene| {
+            scene.resolve_present_animations(half);
+            let mut colors = scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| (sprite.tile.tile_id.0, sprite.color))
+                .chain(
+                    scene
+                        .subpixel_sprites
+                        .iter()
+                        .map(|sprite| (sprite.tile.tile_id.0, sprite.color)),
+                )
+                .collect::<Vec<_>>();
+            colors.sort_by_key(|(tile_id, _)| *tile_id);
+            colors
+        };
+        let expected = vec![
+            (1, opaque(0., 0., 0.)),
+            (2, opaque(1., 1., 1.)),
+            (3, Hsla::default()),
+        ];
+        assert_eq!(colors(&mut scene), expected);
+
+        // The recorded operations are resolved too (the macOS overlay plane
+        // replays them).
+        let subpixel_ops = scene
+            .paint_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)) => {
+                    Some((sprite.tile.tile_id.0, sprite.color))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subpixel_ops,
+            vec![(2, opaque(1., 1., 1.)), (3, Hsla::default())]
+        );
+
+        // A cached view replayed into the next scene keeps every glyph's
+        // animation, subpixel included.
+        let mut next = Scene::default();
+        next.replay(0..scene.paint_operations.len(), &scene);
+        next.finish();
+        assert_eq!(next.sprite_animations.len(), 2);
+        assert_eq!(colors(&mut next), expected);
+        // And it keeps following the clock: a quarter later the band has
+        // left the middle glyph.
+        next.resolve_present_animations(Duration::from_millis(1_700_000_000_750));
+        let middle = next
+            .subpixel_sprites
+            .iter()
+            .find(|sprite| sprite.tile.tile_id.0 == 2)
+            .unwrap();
+        assert_eq!(middle.color, opaque(0., 0., 0.));
+
+        // Replaying only the static glyph carries no animation.
+        let mut static_only = Scene::default();
+        static_only.replay(2..3, &scene);
+        static_only.finish();
+        assert!(!static_only.has_present_animations());
+
+        // A fully clipped animated subpixel glyph leaves nothing behind.
+        let mut clipped = Scene::default();
+        let mut hidden = subpixel_sprite(9);
+        hidden.content_mask.bounds.size = Size::default();
+        clipped.insert_animated_subpixel_sprite(hidden, sweep_animation(0.5));
+        assert!(!clipped.has_present_animations());
     }
 }

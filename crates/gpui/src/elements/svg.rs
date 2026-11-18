@@ -1,9 +1,9 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use crate::{
     App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
+    Interactivity, IntoElement, LayoutId, Pixels, Point, PresentAnimation, Radians, SharedString,
+    Size, StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
 };
 use gpui_util::ResultExt;
 
@@ -11,6 +11,7 @@ use gpui_util::ResultExt;
 pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<Transformation>,
+    animation: Option<PresentAnimation>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
 }
@@ -21,6 +22,7 @@ pub fn svg() -> Svg {
     Svg {
         interactivity: Interactivity::new(),
         transformation: None,
+        animation: None,
         path: None,
         external_path: None,
     }
@@ -43,6 +45,35 @@ impl Svg {
     /// Note that this won't effect the hitbox or layout of the element, only the rendering.
     pub fn with_transformation(mut self, transformation: Transformation) -> Self {
         self.transformation = Some(transformation);
+        self
+    }
+
+    /// Spin the SVG continuously around its center, clockwise, one turn per
+    /// `period`, presenting at most one new frame per `frame_interval`.
+    ///
+    /// The rotation is computed when the window presents a frame, from the
+    /// wall clock, so it costs no re-render, layout or repaint of any view and
+    /// keeps working when the containing view is cached. Spinners with the
+    /// same period turn in sync. With [`App::reduce_motion`] set the SVG is
+    /// painted still. Like [`Self::with_transformation`], it does not affect
+    /// layout or hit testing.
+    pub fn spin(self, period: Duration, frame_interval: Duration) -> Self {
+        self.with_present_animation(PresentAnimation::spin(period, frame_interval))
+    }
+
+    /// Pulse the SVG's opacity continuously, from invisible to its own color
+    /// and back, once per `period`, presenting at most one new frame per
+    /// `frame_interval`. Resolved when the window presents a frame, like
+    /// [`Self::spin`]; with [`App::reduce_motion`] set the SVG is painted at
+    /// its own color.
+    pub fn pulse(self, period: Duration, frame_interval: Duration) -> Self {
+        self.with_present_animation(PresentAnimation::pulse(period, frame_interval))
+    }
+
+    /// Attach a [`PresentAnimation`] resolved at presentation time. See
+    /// [`Self::spin`].
+    pub fn with_present_animation(mut self, animation: PresentAnimation) -> Self {
+        self.animation = Some(animation);
         self
     }
 }
@@ -126,7 +157,15 @@ impl Element for Svg {
                         .unwrap_or_default();
 
                     window
-                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
+                        .paint_animated_svg(
+                            bounds,
+                            path.clone(),
+                            None,
+                            transformation,
+                            self.animation,
+                            color,
+                            cx,
+                        )
                         .log_err();
                 } else if let Some((path, color)) =
                     self.external_path.as_ref().zip(style.text.color)
@@ -147,11 +186,12 @@ impl Element for Svg {
                         .unwrap_or_default();
 
                     window
-                        .paint_svg(
+                        .paint_animated_svg(
                             bounds,
                             path.clone(),
                             Some(&bytes),
                             transformation,
+                            self.animation,
                             color,
                             cx,
                         )
