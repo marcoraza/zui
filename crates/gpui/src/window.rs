@@ -7298,6 +7298,84 @@ mod tests {
         }
     }
 
+    /// Renders one svg that travels along a path holding it at half its
+    /// painted alpha, counting renders.
+    struct Fader {
+        renders: Rc<Cell<u32>>,
+    }
+
+    fn half_faded(_: f32) -> crate::TravelPose {
+        crate::TravelPose {
+            opacity: 0.5,
+            ..crate::TravelPose::REST
+        }
+    }
+
+    impl Render for Fader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().child(
+                crate::svg()
+                    .path("fader.svg")
+                    .size(px(16.))
+                    .text_color(crate::black())
+                    .travel(
+                        std::time::Duration::from_millis(900),
+                        half_faded,
+                        std::time::Duration::ZERO,
+                    ),
+            )
+        }
+    }
+
+    #[test]
+    fn fading_travel_presents_without_rendering() {
+        let mut cx = TestAppContext::single();
+        cx.update(|cx| {
+            cx.svg_renderer = crate::SvgRenderer::new(std::sync::Arc::new(SpinnerAssets));
+        });
+        let renders = Rc::new(Cell::new(0));
+        let handle = cx.add_window({
+            let renders = renders.clone();
+            move |_, _| Fader { renders }
+        });
+        let platform = cx
+            .update_window(handle.into(), |_, window, _| {
+                window.active.set(true);
+                window.platform_window.as_test().unwrap().clone()
+            })
+            .unwrap();
+        let sprite_alpha = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, _| {
+                let sprites: Vec<_> = window
+                    .rendered_frame
+                    .scene
+                    .monochrome_sprites
+                    .iter()
+                    .filter(|sprite| sprite.pad != 0)
+                    .map(|sprite| sprite.color.a)
+                    .collect();
+                (sprites.len(), sprites.first().copied())
+            })
+            .unwrap()
+        };
+        assert!(platform.simulate_display_tick(), "first frame draws");
+        for _ in 0..3 {
+            assert!(
+                platform.simulate_display_tick(),
+                "a live travel must keep frames coming"
+            );
+            let (count, alpha) = sprite_alpha(&mut cx);
+            assert_eq!(count, 1, "the svg is the only animated sprite");
+            let alpha = alpha.unwrap();
+            assert!(
+                (alpha - 0.5).abs() < 1e-6,
+                "the path's opacity scales the painted alpha, got {alpha}"
+            );
+        }
+        assert_eq!(renders.get(), 1, "fading at present time must not render");
+    }
+
     #[test]
     fn spin_presents_no_faster_than_its_frame_interval() {
         let mut h = SpinnerHarness::new(std::time::Duration::from_secs(3600), false);
