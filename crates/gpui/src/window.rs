@@ -3515,6 +3515,33 @@ impl Window {
         result
     }
 
+    /// Pinta o que `f` desenhar escalado por `factor` em volta de `origin`
+    /// (coordenadas da janela), como um `transform: scale()` de CSS com
+    /// `transform-origin`. Só a pintura muda: layout e áreas de clique ficam
+    /// onde estavam, então serve para entradas e saídas curtas (um menu que
+    /// cresce a partir do botão), não para deixar algo escalado parado.
+    /// Escalas aninhadas se compõem. Só pode ser chamada ao pintar.
+    pub fn with_element_scale<R>(
+        &mut self,
+        origin: Point<Pixels>,
+        factor: f32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        if (factor - 1.0).abs() < f32::EPSILON || !factor.is_finite() {
+            return f(self);
+        }
+        let inner = crate::scene::ElementScale::around(origin.scale(self.scale_factor()), factor);
+        let previous = self.next_frame.scene.element_scale;
+        self.next_frame.scene.element_scale = Some(match previous {
+            Some(outer) => outer.then_inner(inner),
+            None => inner,
+        });
+        let result = f(self);
+        self.next_frame.scene.element_scale = previous;
+        result
+    }
+
     pub(crate) fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,

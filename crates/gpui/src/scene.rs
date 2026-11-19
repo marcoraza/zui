@@ -60,6 +60,150 @@ pub struct Scene {
     /// travels inside the sprite, so it survives `finish`'s sorting; `replay`
     /// re-registers it.
     pub(crate) sprite_animations: Vec<SpriteAnimation>,
+    /// Escala ativa de elemento (ver `Window::with_element_scale`): cada
+    /// primitiva inserida enquanto ela vale sai escalada em volta da origem.
+    pub(crate) element_scale: Option<ElementScale>,
+}
+
+/// Escala uniforme de um trecho da árvore, como `p * factor + offset` em
+/// pixels de tela. Aplicada na inserção das primitivas, então a ordem de
+/// desenho, o recorte e o replay já veem a forma final.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ElementScale {
+    pub(crate) factor: f32,
+    pub(crate) offset: Point<f32>,
+}
+
+impl ElementScale {
+    /// Escala `factor` em volta de `origin`.
+    pub(crate) fn around(origin: Point<ScaledPixels>, factor: f32) -> Self {
+        Self {
+            factor,
+            offset: point(origin.x.0 * (1.0 - factor), origin.y.0 * (1.0 - factor)),
+        }
+    }
+
+    /// `inner` dentro desta escala: aplica `inner` primeiro, esta depois.
+    pub(crate) fn then_inner(self, inner: Self) -> Self {
+        Self {
+            factor: self.factor * inner.factor,
+            offset: point(
+                inner.offset.x * self.factor + self.offset.x,
+                inner.offset.y * self.factor + self.offset.y,
+            ),
+        }
+    }
+
+    fn len(&self, v: ScaledPixels) -> ScaledPixels {
+        ScaledPixels(v.0 * self.factor)
+    }
+
+    fn point(&self, p: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        point(
+            ScaledPixels(p.x.0 * self.factor + self.offset.x),
+            ScaledPixels(p.y.0 * self.factor + self.offset.y),
+        )
+    }
+
+    fn bounds(&self, b: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: self.point(b.origin),
+            size: size(self.len(b.size.width), self.len(b.size.height)),
+        }
+    }
+
+    fn mask(&self, m: ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: self.bounds(m.bounds),
+        }
+    }
+
+    fn corners(&self, c: Corners<ScaledPixels>) -> Corners<ScaledPixels> {
+        Corners {
+            top_left: self.len(c.top_left),
+            top_right: self.len(c.top_right),
+            bottom_right: self.len(c.bottom_right),
+            bottom_left: self.len(c.bottom_left),
+        }
+    }
+
+    fn edges(&self, e: Edges<ScaledPixels>) -> Edges<ScaledPixels> {
+        Edges {
+            top: self.len(e.top),
+            right: self.len(e.right),
+            bottom: self.len(e.bottom),
+            left: self.len(e.left),
+        }
+    }
+
+    fn fade(&self, f: EdgeFadeParams) -> EdgeFadeParams {
+        if f == EdgeFadeParams::default() {
+            return f;
+        }
+        let x = |v: f32| v * self.factor + self.offset.x;
+        let y = |v: f32| v * self.factor + self.offset.y;
+        EdgeFadeParams {
+            top_y: y(f.top_y),
+            bottom_y: y(f.bottom_y),
+            band_top: f.band_top * self.factor,
+            band_bottom: f.band_bottom * self.factor,
+            left_x: x(f.left_x),
+            right_x: x(f.right_x),
+            band_left: f.band_left * self.factor,
+            band_right: f.band_right * self.factor,
+        }
+    }
+
+    fn apply(&self, primitive: &mut Primitive) {
+        match primitive {
+            Primitive::Shadow(s) => {
+                s.bounds = self.bounds(s.bounds);
+                s.content_mask = self.mask(s.content_mask.clone());
+                s.corner_radii = self.corners(s.corner_radii);
+                s.blur_radius = self.len(s.blur_radius);
+                s.element_bounds = self.bounds(s.element_bounds);
+                s.element_corner_radii = self.corners(s.element_corner_radii);
+            }
+            Primitive::Quad(q) => {
+                q.bounds = self.bounds(q.bounds);
+                q.content_mask = self.mask(q.content_mask.clone());
+                q.corner_radii = self.corners(q.corner_radii);
+                q.border_widths = self.edges(q.border_widths);
+                q.fade = self.fade(q.fade);
+            }
+            Primitive::Path(path) => {
+                path.bounds = self.bounds(path.bounds);
+                path.content_mask = self.mask(path.content_mask.clone());
+                for v in &mut path.vertices {
+                    v.xy_position = self.point(v.xy_position);
+                    v.content_mask = self.mask(v.content_mask.clone());
+                }
+            }
+            Primitive::Underline(u) => {
+                u.bounds = self.bounds(u.bounds);
+                u.content_mask = self.mask(u.content_mask.clone());
+                u.thickness = self.len(u.thickness);
+            }
+            Primitive::MonochromeSprite(s) => {
+                s.bounds = self.bounds(s.bounds);
+                s.content_mask = self.mask(s.content_mask.clone());
+            }
+            Primitive::SubpixelSprite(s) => {
+                s.bounds = self.bounds(s.bounds);
+                s.content_mask = self.mask(s.content_mask.clone());
+            }
+            Primitive::PolychromeSprite(s) => {
+                s.bounds = self.bounds(s.bounds);
+                s.content_mask = self.mask(s.content_mask.clone());
+                s.corner_radii = self.corners(s.corner_radii);
+                s.fade = self.fade(s.fade);
+            }
+            Primitive::Surface(s) => {
+                s.bounds = self.bounds(s.bounds);
+                s.content_mask = self.mask(s.content_mask.clone());
+            }
+        }
+    }
 }
 
 #[expect(missing_docs)]
@@ -78,6 +222,7 @@ impl Scene {
         self.surfaces.clear();
         self.backdrop_blurs.clear();
         self.sprite_animations.clear();
+        self.element_scale = None;
     }
 
     /// Whether there are no drawable operations, ignoring empty layer markers.
@@ -104,6 +249,12 @@ impl Scene {
     }
 
     pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
+        if let Some(scale) = self.element_scale {
+            blur.bounds = scale.bounds(blur.bounds);
+            blur.content_mask = scale.mask(blur.content_mask.clone());
+            blur.corner_radii = scale.corners(blur.corner_radii);
+            blur.blur_radius = scale.len(blur.blur_radius);
+        }
         let clipped_bounds = blur.bounds.intersect(&blur.content_mask.bounds);
         if clipped_bounds.is_empty() {
             return;
@@ -120,6 +271,9 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        if let Some(scale) = self.element_scale {
+            scale.apply(&mut primitive);
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -208,6 +362,8 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        // O que volta do quadro anterior já saiu escalado quando foi pintado.
+        let scale = self.element_scale.take();
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 // An animated sprite's id points into the previous scene's
@@ -229,6 +385,7 @@ impl Scene {
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
+        self.element_scale = scale;
     }
 
     pub fn finish(&mut self) {
@@ -2219,5 +2376,30 @@ mod tests {
             })
             .collect();
         assert_eq!(ranges, [(0, 0..2), (1, 2..4), (0, 4..5)]);
+    }
+}
+
+#[cfg(test)]
+mod element_scale_tests {
+    use super::*;
+
+    #[test]
+    fn escala_em_volta_da_origem_deixa_a_origem_parada() {
+        let s = ElementScale::around(point(ScaledPixels(100.0), ScaledPixels(50.0)), 0.5);
+        let o = s.point(point(ScaledPixels(100.0), ScaledPixels(50.0)));
+        assert_eq!((o.x.0, o.y.0), (100.0, 50.0));
+        let p = s.point(point(ScaledPixels(200.0), ScaledPixels(150.0)));
+        assert_eq!((p.x.0, p.y.0), (150.0, 100.0));
+    }
+
+    #[test]
+    fn escalas_aninhadas_se_compoem() {
+        let outer = ElementScale::around(point(ScaledPixels(0.0), ScaledPixels(0.0)), 0.5);
+        let inner = ElementScale::around(point(ScaledPixels(100.0), ScaledPixels(100.0)), 0.5);
+        let both = outer.then_inner(inner);
+        let p = point(ScaledPixels(200.0), ScaledPixels(200.0));
+        let a = both.point(p);
+        let b = outer.point(inner.point(p));
+        assert_eq!((a.x.0, a.y.0), (b.x.0, b.y.0));
     }
 }
