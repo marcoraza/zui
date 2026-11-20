@@ -4380,7 +4380,17 @@ impl Window {
         position: f32,
         cx: &App,
     ) -> Result<()> {
-        let animation = animation.filter(|animation| !animation.is_static() && !cx.reduce_motion());
+        let animation = animation.filter(|animation| {
+            !animation.is_static()
+                && !cx.reduce_motion()
+                // A one-shot fade already over paints still, without an
+                // animation that would cost a presented frame.
+                && !animation.is_settled_at(
+                    web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
+                        .unwrap_or_default(),
+                )
+        });
         self.insert_glyph(
             origin, font_id, glyph_id, font_size, color, animation, position,
         )

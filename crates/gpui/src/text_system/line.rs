@@ -5,6 +5,7 @@ use crate::{
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Pre-computed glyph data for efficient painting without per-glyph cache lookups.
@@ -98,6 +99,7 @@ impl ShapedLine {
             &self.decoration_runs,
             &[],
             None,
+            &[],
             window,
             cx,
         )?;
@@ -295,6 +297,7 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             None,
+            &[],
             window,
             cx,
         )?;
@@ -307,6 +310,8 @@ impl WrappedLine {
     /// text is the center of its advance in the unwrapped line divided by the
     /// unwrapped line's width, so a [`crate::PresentMotion::Sweep`] runs in
     /// reading order through the wrapped rows, as if they were one line.
+    /// A glyph whose byte offset (in this line) falls inside one of `ranges`
+    /// takes that range's animation instead; the first match wins.
     pub(crate) fn paint_animated(
         &self,
         origin: Point<Pixels>,
@@ -314,6 +319,7 @@ impl WrappedLine {
         align: TextAlign,
         bounds: Option<Bounds<Pixels>>,
         animation: Option<PresentAnimation>,
+        ranges: &[(Range<usize>, PresentAnimation)],
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
@@ -331,6 +337,7 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             animation,
+            ranges,
             window,
             cx,
         )
@@ -376,6 +383,7 @@ fn paint_line(
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
     animation: Option<PresentAnimation>,
+    ranges: &[(Range<usize>, PresentAnimation)],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -568,14 +576,19 @@ fn paint_line(
                             glyph.id,
                             layout.font_size,
                         )?;
-                    } else if animation.is_some() {
+                    } else if let Some(animation) = ranges
+                        .iter()
+                        .find(|(range, _)| range.contains(&glyph.index))
+                        .map(|(_, animation)| *animation)
+                        .or(animation)
+                    {
                         window.paint_animated_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                             color,
-                            animation,
+                            Some(animation),
                             glyph_position_along_line(layout, run_ix, glyph_ix),
                             cx,
                         )?;

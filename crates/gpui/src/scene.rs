@@ -60,6 +60,11 @@ pub struct Scene {
     /// travels inside the sprite, so it survives `finish`'s sorting; `replay`
     /// re-registers it.
     pub(crate) sprite_animations: Vec<SpriteAnimation>,
+    /// The wall-clock time (since the Unix epoch) of the last
+    /// [`Scene::resolve_present_animations`]. A one-shot animation
+    /// ([`PresentMotion::FadeIn`]) stops asking for frames once it has been
+    /// presented at or past its end.
+    pub(crate) last_resolved: Option<Duration>,
     /// Escala ativa de elemento (ver `Window::with_element_scale`): cada
     /// primitiva inserida enquanto ela vale sai escalada em volta da origem.
     pub(crate) element_scale: Option<ElementScale>,
@@ -222,6 +227,7 @@ impl Scene {
         self.surfaces.clear();
         self.backdrop_blurs.clear();
         self.sprite_animations.clear();
+        self.last_resolved = None;
         self.element_scale = None;
     }
 
@@ -405,13 +411,22 @@ impl Scene {
 
     /// Whether any sprite in this scene animates at presentation time.
     pub(crate) fn has_present_animations(&self) -> bool {
-        !self.sprite_animations.is_empty()
+        self.live_animations().next().is_some()
+    }
+
+    /// The animations that may still change what is on screen: every
+    /// continuous one, and each one-shot one not yet presented at or past its
+    /// end.
+    fn live_animations(&self) -> impl Iterator<Item = &SpriteAnimation> {
+        let last = self.last_resolved;
+        self.sprite_animations
+            .iter()
+            .filter(move |animation| last.is_none_or(|at| !animation.animation.is_settled_at(at)))
     }
 
     /// The shortest frame interval requested by the scene's animations.
     pub(crate) fn present_animation_interval(&self) -> Option<Duration> {
-        self.sprite_animations
-            .iter()
+        self.live_animations()
             .map(|animation| animation.animation.frame_interval)
             .min()
     }
@@ -426,6 +441,7 @@ impl Scene {
         if self.sprite_animations.is_empty() {
             return;
         }
+        self.last_resolved = Some(since_epoch);
         let animations = &self.sprite_animations;
         let resolve = |pad: u32, transformation: &mut TransformationMatrix, color: &mut Hsla| {
             if pad != 0 {
@@ -1112,6 +1128,18 @@ pub enum PresentMotion {
         /// stays `Copy` and cheap to evaluate on every presented frame.
         path: TravelPath,
     },
+    /// One-shot fade in: the sprite's alpha goes linearly from 0 at `start`
+    /// to the alpha it was painted with at `start + duration`, then stays
+    /// there. Before `start` the sprite is invisible. Unlike the continuous
+    /// motions it ends: once a presented frame is past its end the window
+    /// stops asking for frames for it, so text that streams in can fade word
+    /// by word without re-rendering any view.
+    FadeIn {
+        /// When the fade starts, as wall-clock time since the Unix epoch.
+        start: Duration,
+        /// How long the fade takes.
+        duration: Duration,
+    },
 }
 
 /// Where a [`PresentMotion::Travel`] puts its sprite at one phase.
@@ -1177,6 +1205,16 @@ impl PartialEq for PresentMotion {
                     path: b_path,
                 },
             ) => a_period == b_period && std::ptr::fn_addr_eq(*a_path, *b_path),
+            (
+                Self::FadeIn {
+                    start: a_start,
+                    duration: a_duration,
+                },
+                Self::FadeIn {
+                    start: b_start,
+                    duration: b_duration,
+                },
+            ) => a_start == b_start && a_duration == b_duration,
             _ => false,
         }
     }
@@ -1225,6 +1263,25 @@ impl PresentAnimation {
         }
     }
 
+    /// A one-shot fade in from `start` (wall-clock time since the Unix
+    /// epoch) over `duration`, at most one frame per `frame_interval`. See
+    /// [`PresentMotion::FadeIn`].
+    pub fn fade_in(start: Duration, duration: Duration, frame_interval: Duration) -> Self {
+        Self {
+            motion: PresentMotion::FadeIn { start, duration },
+            frame_interval,
+        }
+    }
+
+    /// Whether this animation has nothing left to show from `since_epoch`
+    /// on: a one-shot animation past its end. Continuous ones never settle.
+    pub fn is_settled_at(&self, since_epoch: Duration) -> bool {
+        match self.motion {
+            PresentMotion::FadeIn { start, duration } => since_epoch >= start + duration,
+            _ => false,
+        }
+    }
+
     /// A sprite moving along `path` once per `period`, at most one frame per
     /// `frame_interval`. See [`PresentMotion::Travel`].
     pub fn travel(period: Duration, path: TravelPath, frame_interval: Duration) -> Self {
@@ -1241,6 +1298,7 @@ impl PresentAnimation {
             | PresentMotion::Pulse { period }
             | PresentMotion::Sweep { period, .. }
             | PresentMotion::Travel { period, .. } => period.is_zero(),
+            PresentMotion::FadeIn { duration, .. } => duration.is_zero(),
         }
     }
 
@@ -1298,7 +1356,11 @@ impl SpriteAnimation {
                 };
                 let pose = path(phase);
                 let finite = |v: f32| if v.is_finite() { v } else { 0. };
-                let scale = if pose.scale.is_finite() { pose.scale.max(0.) } else { 1. };
+                let scale = if pose.scale.is_finite() {
+                    pose.scale.max(0.)
+                } else {
+                    1.
+                };
                 let at = point(
                     ScaledPixels(self.pivot.x.0 + finite(pose.offset.x) * self.extent.width.0),
                     ScaledPixels(self.pivot.y.0 + finite(pose.offset.y) * self.extent.height.0),
@@ -1313,7 +1375,9 @@ impl SpriteAnimation {
                         )),
                 )
             }
-            PresentMotion::Pulse { .. } | PresentMotion::Sweep { .. } => self.base,
+            PresentMotion::Pulse { .. }
+            | PresentMotion::Sweep { .. }
+            | PresentMotion::FadeIn { .. } => self.base,
         }
     }
 
@@ -1346,6 +1410,10 @@ impl SpriteAnimation {
                 let weight = weight(phase, self.position);
                 mix_premultiplied(self.color, to, if weight.is_nan() { 0. } else { weight })
             }
+            PresentMotion::FadeIn { start, duration } => {
+                self.color
+                    .opacity(fade_in_progress(since_epoch, start, duration))
+            }
         }
     }
 }
@@ -1372,6 +1440,17 @@ fn mix_premultiplied(from: Hsla, to: Hsla, t: f32) -> Hsla {
         b: lerp(f.b * f.a, g.b * g.a) / a,
         a,
     })
+}
+
+/// How far a [`PresentMotion::FadeIn`] is at `since_epoch`, in `0..=1`.
+fn fade_in_progress(since_epoch: Duration, start: Duration, duration: Duration) -> f32 {
+    if since_epoch <= start {
+        return 0.;
+    }
+    if duration.is_zero() {
+        return 1.;
+    }
+    ((since_epoch - start).as_secs_f32() / duration.as_secs_f32()).clamp(0., 1.)
 }
 
 /// Where the wall clock is inside a cycle of `period`, in `0..1`; `None` for
@@ -1906,6 +1985,67 @@ mod tests {
         scene.finish();
         scene.resolve_present_animations(Duration::from_millis(1_700_000_000_250));
         assert!((scene.monochrome_sprites[0].color.a - 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fade_in_ends_and_stops_asking_for_frames() {
+        let painted = Hsla {
+            h: 0.,
+            s: 0.,
+            l: 1.,
+            a: 0.8,
+        };
+        let start = Duration::from_millis(1_700_000_000_000);
+        let fade = SpriteAnimation {
+            animation: PresentAnimation::fade_in(
+                start,
+                Duration::from_millis(200),
+                Duration::from_millis(33),
+            ),
+            color: painted,
+            ..spin_animation(TransformationMatrix::unit())
+        };
+        let alpha = |ms: u64| fade.color_at(start + Duration::from_millis(ms)).a;
+        // Invisible before and at the start, half way at 100 ms, painted from the end on.
+        assert!(fade.color_at(start - Duration::from_millis(50)).a.abs() < 1e-4);
+        assert!(alpha(0).abs() < 1e-4);
+        assert!((alpha(100) - 0.4).abs() < 1e-4);
+        assert!((alpha(200) - 0.8).abs() < 1e-4);
+        assert!((alpha(5_000) - 0.8).abs() < 1e-4);
+        assert_eq!(fade.transformation_at(start), TransformationMatrix::unit());
+        assert!(
+            !fade
+                .animation
+                .is_settled_at(start + Duration::from_millis(199))
+        );
+        assert!(
+            fade.animation
+                .is_settled_at(start + Duration::from_millis(200))
+        );
+
+        let mut scene = Scene::default();
+        let mut fading = sprite(1);
+        fading.color = painted;
+        scene.insert_animated_monochrome_sprite(fading, fade);
+        scene.finish();
+        // Not presented yet: it asks for frames.
+        assert!(scene.has_present_animations());
+        scene.resolve_present_animations(start + Duration::from_millis(100));
+        assert!(scene.has_present_animations());
+        assert!((scene.monochrome_sprites[0].color.a - 0.4).abs() < 1e-4);
+        // Presented past its end: the sprite keeps the painted color and the
+        // scene stops asking for frames.
+        scene.resolve_present_animations(start + Duration::from_millis(240));
+        assert!((scene.monochrome_sprites[0].color.a - 0.8).abs() < 1e-4);
+        assert!(!scene.has_present_animations());
+        assert_eq!(scene.present_animation_interval(), None);
+
+        // A continuous animation beside it keeps the scene live.
+        scene.insert_animated_monochrome_sprite(
+            sprite(2),
+            spin_animation(TransformationMatrix::unit()),
+        );
+        assert!(scene.has_present_animations());
     }
 
     /// Resolve at a quarter turn and return (tile id, transformed probe point)

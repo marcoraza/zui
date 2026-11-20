@@ -395,6 +395,7 @@ pub struct StyledText {
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     layout: TextLayout,
     animation: Option<PresentAnimation>,
+    animated_ranges: Vec<(Range<usize>, PresentAnimation)>,
 }
 
 impl StyledText {
@@ -407,6 +408,7 @@ impl StyledText {
             delayed_font_family_overrides: None,
             layout: TextLayout::default(),
             animation: None,
+            animated_ranges: Vec::new(),
         }
     }
 
@@ -428,6 +430,20 @@ impl StyledText {
     /// glyph of the text. See [`Self::sweep`].
     pub fn with_present_animation(mut self, animation: PresentAnimation) -> Self {
         self.animation = Some(animation);
+        self
+    }
+
+    /// Attach a [`PresentAnimation`] to the glyphs of each byte range of the
+    /// text, resolved at presentation time like [`Self::sweep`]. A glyph in
+    /// more than one range takes the first; a glyph in none takes the
+    /// animation of [`Self::with_present_animation`], if any. Built for
+    /// [`PresentAnimation::fade_in`]: streamed words that fade in one by one
+    /// while the view around them stays cached.
+    pub fn with_present_ranges(
+        mut self,
+        ranges: impl IntoIterator<Item = (Range<usize>, PresentAnimation)>,
+    ) -> Self {
+        self.animated_ranges = ranges.into_iter().collect();
         self
     }
 
@@ -620,8 +636,13 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.layout
-            .paint_animated(&self.text, self.animation, window, cx)
+        self.layout.paint_animated(
+            &self.text,
+            self.animation,
+            &self.animated_ranges,
+            window,
+            cx,
+        )
     }
 }
 
@@ -814,13 +835,14 @@ impl TextLayout {
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
-        self.paint_animated(text, None, window, cx)
+        self.paint_animated(text, None, &[], window, cx)
     }
 
     fn paint_animated(
         &self,
         text: &str,
         animation: Option<PresentAnimation>,
+        ranges: &[(Range<usize>, PresentAnimation)],
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -837,7 +859,18 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
+        let mut line_start = 0;
+        let mut line_ranges = Vec::new();
         for line in &element_state.lines {
+            // The ranges are offsets in the whole text; each line (split at
+            // `\n`) wants them in its own offsets.
+            let line_end = line_start + line.len();
+            line_ranges.clear();
+            line_ranges.extend(ranges.iter().filter_map(|(range, animation)| {
+                let start = range.start.max(line_start);
+                let end = range.end.min(line_end);
+                (start < end).then(|| (start - line_start..end - line_start, *animation))
+            }));
             line.paint_background(
                 line_origin,
                 line_height,
@@ -853,11 +886,13 @@ impl TextLayout {
                 text_style.text_align,
                 Some(bounds),
                 animation,
+                &line_ranges,
                 window,
                 cx,
             )
             .log_err();
             line_origin.y += line.size(line_height).height;
+            line_start = line_end + 1;
         }
     }
 
